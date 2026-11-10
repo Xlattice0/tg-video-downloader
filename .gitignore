@@ -1,0 +1,35 @@
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.Python
+dist/
+build/
+
+# 本地凭据与会话（切勿提交）
+data/
+*.session
+*.session-journal
+config.json
+secrets
+.env
+
+# 下载目录
+downloads/
+*.mp4
+*.mov
+*.mkv
+*.webm
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+Desktop.ini
