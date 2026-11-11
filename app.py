@@ -90,6 +90,7 @@ from tgcore import (
     update_config,
     validate_proxy_settings,
     video_display_title,
+    video_row_subtitle,
     visible_chat_selection,
 )
 
@@ -1954,14 +1955,7 @@ class VideoRow(tk.Frame):
         self.lbl_title.configure(text=elide_text(Fonts.body, self._title_full, width))
 
     def _meta_text(self, pref: Optional[str] = None) -> str:
-        chosen = pick_video_quality(self.item.qualities or [], pref or self._quality_pref)
-        size = chosen.size if chosen else self.item.size
-        parts = [format_bytes(size), format_date_short(self.item.date)]
-        if self.item.note:
-            parts.append(self.item.note)
-        elif not self.item.downloadable:
-            parts.append("无法下载")
-        return " · ".join(p for p in parts if p)
+        return video_row_subtitle(self.item, pref or self._quality_pref)
 
     def _sync_done_badge(self) -> None:
         row_bg = C_SEL if self.selected else C_CARD

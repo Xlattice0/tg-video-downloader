@@ -1136,6 +1136,37 @@ def pick_video_quality(qualities: list[VideoQuality], preference: Optional[str] 
     return qualities[-1]
 
 
+def known_quality_label(quality: Optional[VideoQuality]) -> str:
+    """只展示来源里真实有的清晰度。没有宽高时的「原画」不写进行里。"""
+    if quality is None:
+        return ""
+    label = (quality.label or "").strip()
+    if not label or label == "原画":
+        return ""
+    return label
+
+
+def video_row_subtitle(item: VideoItem, preference: Optional[str] = None) -> str:
+    """对话选片行的副标题，例如「1080p · 42.6 MB · 今天 16:08」。
+
+    清晰度用质量选择器同一套已有文件，不在没有清晰度时编一个。
+    """
+    chosen = pick_video_quality(list(getattr(item, "qualities", None) or []), preference)
+    size = chosen.size if chosen is not None and chosen.size else getattr(item, "size", None)
+    parts: list[str] = []
+    label = known_quality_label(chosen)
+    if label:
+        parts.append(label)
+    parts.append(format_bytes(size))
+    parts.append(format_date_short(getattr(item, "date", None)))
+    note = (getattr(item, "note", None) or "").strip()
+    if note:
+        parts.append(note)
+    elif not getattr(item, "downloadable", True):
+        parts.append("无法下载")
+    return " · ".join(part for part in parts if part)
+
+
 def _photo_size_area(thumb: Any) -> int:
     w = int(getattr(thumb, "w", 0) or 0)
     h = int(getattr(thumb, "h", 0) or 0)

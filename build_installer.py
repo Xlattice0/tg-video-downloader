@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 ISS = ROOT / "installer" / "setup.iss"
 DIST_EXE = ROOT / "dist" / "TGVideoDownloader.exe"
-SETUP_NAME = "TGVideoDownloader-Setup-1.3.16.exe"
+SETUP_NAME = "TGVideoDownloader-Setup-1.3.15.exe"
 DIST_SETUP = ROOT / "dist" / SETUP_NAME
 INNO_INSTALLER = ROOT / "build" / "innosetup-install.exe"
 INNO_URL = "https://files.jrsoftware.org/is/6/innosetup-6.5.4.exe"

@@ -38,6 +38,7 @@ from tgcore import (
     UI_MODE_PROFESSIONAL,
     UserFacingError,
     VideoItem,
+    VideoQuality,
     VideoScanState,
     _normalize_phone,
     appearance_choices,
@@ -85,6 +86,7 @@ from tgcore import (
     update_config,
     validate_proxy_settings,
     video_downloaded_label,
+    video_row_subtitle,
     visible_chat_selection,
 )
 
@@ -518,6 +520,51 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(snap_quality_height(647), 720)
         self.assertEqual(quality_pref_value("最高"), "highest")
         self.assertEqual(quality_pref_label("1080"), "1080p")
+        today = datetime.now(timezone.utc)
+        high = VideoQuality(label="1080p", width=1920, height=1080, size=44_669_338, document=None, key="1080")
+        low = VideoQuality(label="720p", width=1280, height=720, size=8_000_000, document=None, key="720")
+        item = VideoItem(
+            message_id=1,
+            date=today,
+            duration=12,
+            size=high.size,
+            filename="今日实验演示.mp4",
+            caption="今日实验演示",
+            kind="video",
+            qualities=[high, low],
+        )
+        shown = video_row_subtitle(item, "highest")
+        self.assertTrue(shown.startswith("1080p · "))
+        self.assertIn(format_bytes(high.size), shown)
+        self.assertIn("今天", shown)
+        picked = video_row_subtitle(item, "720")
+        self.assertTrue(picked.startswith("720p · "))
+        self.assertIn(format_bytes(low.size), picked)
+        unknown = VideoQuality(label="原画", width=0, height=0, size=2048, document=None, key="highest")
+        bare = VideoItem(
+            message_id=2,
+            date=today,
+            duration=1,
+            size=2048,
+            filename="clip.mp4",
+            caption="",
+            kind="video",
+            qualities=[unknown],
+        )
+        bare_text = video_row_subtitle(bare, "highest")
+        self.assertNotIn("原画", bare_text)
+        self.assertNotIn("1080p", bare_text)
+        self.assertTrue(bare_text.startswith(format_bytes(2048)))
+        empty = VideoItem(
+            message_id=3,
+            date=today,
+            duration=1,
+            size=100,
+            filename="plain.mp4",
+            caption="",
+            kind="video",
+        )
+        self.assertNotIn("p ·", video_row_subtitle(empty))
         self.assertEqual(sanitize_filename('a<>:"b'), "a_b")
         self.assertTrue(sanitize_filename("CON").startswith("_"))
         msg = _msg(12, _video_media(1, attrs=[_video_attr(), DocumentAttributeFilename("clip:1.mp4")]))

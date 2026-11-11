@@ -1,4 +1,4 @@
-# TG视频下载 1.3.16
+# TG视频下载 1.3.15
 # -*- mode: python ; coding: utf-8 -*-
 # 本地：双击 build_windows.bat；CI：python -m PyInstaller --noconfirm tg-video-downloader.spec
 from pathlib import Path

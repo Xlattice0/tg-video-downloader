@@ -176,23 +176,30 @@ class UiShellTests(unittest.TestCase):
         self.assertIn("关于", menu)
         app._close_flyout()
 
-        from tgcore import VideoItem
+        from datetime import datetime, timezone
+
+        from tgcore import VideoItem, VideoQuality
 
         item = VideoItem(
             message_id=8,
-            date=None,
+            date=datetime.now(timezone.utc),
             duration=4,
-            size=100,
+            size=44_669_338,
             filename="片头花絮.mp4",
             caption="片头花絮",
             kind="video",
             downloaded=True,
+            qualities=[
+                VideoQuality(label="1080p", width=1920, height=1080, size=44_669_338, document=None, key="1080")
+            ],
         )
         row = self.appmod.VideoRow(app, item, lambda _item: None)
         app.update_idletasks()
         self.assertEqual(row.lbl_done.cget("text"), "已下载")
         self.assertNotIn("peer", row.lbl_done.cget("text"))
         self.assertNotIn("message", row.lbl_done.cget("text").lower())
+        self.assertIn("1080p", row.lbl_meta.cget("text"))
+        self.assertIn("今天", row.lbl_meta.cget("text"))
         row.destroy()
 
         app.tasks.upsert("live", "夜间街景.mp4", "running", current=10, total=40, speed=1000, wait_seconds=32)
