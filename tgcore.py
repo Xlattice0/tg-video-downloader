@@ -118,6 +118,8 @@ DATA_DIR = app_dir() / "data"
 CONFIG_PATH = DATA_DIR / "config.json"
 SESSION_PATH = DATA_DIR / "tg_session"
 AVATAR_DIR = DATA_DIR / "avatars"
+QUEUE_PATH = DATA_DIR / "download_queue.json"
+DOWNLOAD_INDEX_PATH = DATA_DIR / "downloads_index.json"
 QUALITY_HIGHEST = "highest"
 
 
@@ -198,6 +200,8 @@ class VideoItem:
     qualities: list[VideoQuality] = field(default_factory=list)
     note: str = ""
     downloadable: bool = True
+    document_id: Optional[int] = None
+    downloaded: bool = False
 
 
 def ensure_data_dir() -> None:
@@ -1167,7 +1171,28 @@ def video_item_from_message(msg: Any) -> Optional[VideoItem]:
         qualities=qualities,
         note=info.note,
         downloadable=info.downloadable,
+        document_id=primary_document_id(msg),
     )
+
+
+def primary_document_id(msg: Any) -> Optional[int]:
+    """消息上第一个视频文件的 document id。没有则为 None。"""
+    for doc in iter_video_documents(msg):
+        did = getattr(doc, "id", None)
+        if isinstance(did, int):
+            return int(did)
+    return None
+
+
+def video_item_document_ids(item: VideoItem) -> set[int]:
+    ids: set[int] = set()
+    if isinstance(item.document_id, int):
+        ids.add(int(item.document_id))
+    for quality in item.qualities or []:
+        did = getattr(getattr(quality, "document", None), "id", None)
+        if isinstance(did, int):
+            ids.add(int(did))
+    return ids
 
 
 def video_display_title(item: VideoItem) -> str:
@@ -1822,6 +1847,15 @@ def plan_link_jobs(links: Iterable[str]) -> list[LinkJob]:
 REMOVABLE_TASK_STATUSES = {"queued", "paused", "stopped", "error", "done", "running"}
 
 
+# 关闭时正在下载的任务恢复成这个状态，避免界面假装还在跑。
+INTERRUPTED_TASK_HINT = "上次关闭时未下完，已停止。可删除后重新下载。"
+
+# 这些状态会写进 data/download_queue.json。已完成的不回到任务列表，只记入下载记录。
+PERSISTED_TASK_STATUSES = {"queued", "paused", "stopped", "error", "running"}
+
+_UNSET = object()
+
+
 @dataclass
 class QueueTask:
     key: str
@@ -1832,22 +1866,171 @@ class QueueTask:
     current: int = 0
     total: int = 0
     speed: float = 0.0
+    peer_id: Optional[int] = None
+    message_id: Optional[int] = None
+    document_id: Optional[int] = None
+    save_path: str = ""
+
+
+def canonical_peer_id(value: Any) -> Optional[int]:
+    """对话列表和链接解析共用的 peer id。频道会变成 -100…，和 dialog.id 一致。"""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if text.lstrip("-").isdigit():
+            return int(text)
+        return None
+    if type(value).__name__ == "DialogItem":
+        raw = getattr(value, "id", None)
+        return int(raw) if isinstance(raw, int) else None
+    try:
+        from telethon.utils import get_peer_id
+
+        return int(get_peer_id(value))
+    except Exception:
+        raw = getattr(value, "id", None)
+        return int(raw) if isinstance(raw, int) else None
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _task_from_dict(raw: dict) -> Optional[QueueTask]:
+    if not isinstance(raw, dict):
+        return None
+    key = str(raw.get("key") or "").strip()
+    if not key:
+        return None
+    status = str(raw.get("status") or "queued").strip() or "queued"
+    try:
+        current = int(raw.get("current") or 0)
+        total = int(raw.get("total") or 0)
+    except (TypeError, ValueError):
+        current, total = 0, 0
+    peer = raw.get("peer_id")
+    message_id = raw.get("message_id")
+    document_id = raw.get("document_id")
+    task = QueueTask(
+        key=key,
+        name=str(raw.get("name") or key),
+        status=status,
+        url=str(raw.get("url") or ""),
+        error=str(raw.get("error") or ""),
+        current=current,
+        total=total,
+        speed=0.0,
+        peer_id=canonical_peer_id(peer),
+        message_id=int(message_id) if isinstance(message_id, int) or (isinstance(message_id, str) and message_id.lstrip("-").isdigit()) else None,
+        document_id=int(document_id) if isinstance(document_id, int) else None,
+        save_path=str(raw.get("save_path") or ""),
+    )
+    if isinstance(message_id, str) and message_id.lstrip("-").isdigit():
+        task.message_id = int(message_id)
+    return task
+
+
+def normalize_task_for_restore(task: QueueTask) -> Optional[QueueTask]:
+    """已完成的不回到任务列表。中断中的改为已停止，不假装还在下载。"""
+    status = (task.status or "").strip()
+    if status == "done":
+        return None
+    if status not in PERSISTED_TASK_STATUSES and status not in {"paused", "stopped", "queued", "error"}:
+        return None
+    task.speed = 0.0
+    if status in ("running", "paused"):
+        task.status = "stopped"
+        if not (task.error or "").strip():
+            task.error = INTERRUPTED_TASK_HINT
+    return task
+
+
+def restored_link_text(tasks: Iterable[QueueTask]) -> str:
+    """把未完成任务里的链接放回输入框，方便再次点「开始下载」。"""
+    urls: list[str] = []
+    seen: set[str] = set()
+    for task in tasks:
+        url = (task.url or "").strip()
+        if url and url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return "\n".join(urls)
+
+
+def _queue_payload(items: dict[str, QueueTask], order: list[str]) -> dict:
+    tasks: list[dict] = []
+    for key in order:
+        item = items.get(key)
+        if item is None or item.status not in PERSISTED_TASK_STATUSES:
+            continue
+        tasks.append(
+            {
+                "key": item.key,
+                "name": item.name,
+                "status": item.status,
+                "url": item.url,
+                "error": item.error,
+                "current": item.current,
+                "total": item.total,
+                "peer_id": item.peer_id,
+                "message_id": item.message_id,
+                "document_id": item.document_id,
+                "save_path": item.save_path,
+            }
+        )
+    return {"version": 1, "tasks": tasks}
+
+
+def load_unfinished_tasks(path: Path) -> list[QueueTask]:
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return []
+    rows = raw.get("tasks") if isinstance(raw, dict) else None
+    if not isinstance(rows, list):
+        return []
+    loaded: list[QueueTask] = []
+    seen: set[str] = set()
+    for row in rows:
+        task = _task_from_dict(row)
+        if task is None or task.key in seen:
+            continue
+        task = normalize_task_for_restore(task)
+        if task is None:
+            continue
+        seen.add(task.key)
+        loaded.append(task)
+    return loaded
 
 
 class DownloadQueue:
-    """链接 / 对话下载任务的状态。界面只负责显示，删除和取消以这里为准。"""
+    """链接 / 对话下载任务的状态。界面只负责显示，删除和取消以这里为准。
 
-    def __init__(self) -> None:
+    ``persist_path`` 指向应用数据目录里的队列文件。只保存未完成项；
+    进程重启后正在下载的会变成已停止。
+    """
+
+    def __init__(self, persist_path: Optional[Path] = None) -> None:
         self._lock = threading.Lock()
         self._items: dict[str, QueueTask] = {}
         self._order: list[str] = []
         self._cancelled: set[str] = set()
+        self._persist_path = Path(persist_path) if persist_path else None
+        if self._persist_path is not None:
+            self._load()
 
     def clear(self) -> None:
         with self._lock:
             self._items.clear()
             self._order.clear()
             self._cancelled.clear()
+            self._save_locked()
 
     def keys(self) -> list[str]:
         with self._lock:
@@ -1876,6 +2059,10 @@ class DownloadQueue:
         total: int = 0,
         speed: float = 0.0,
         index: Optional[int] = None,
+        peer_id: Any = _UNSET,
+        message_id: Any = _UNSET,
+        document_id: Any = _UNSET,
+        save_path: Any = _UNSET,
     ) -> None:
         with self._lock:
             if key in self._cancelled and status in ("queued", "running"):
@@ -1883,6 +2070,41 @@ class DownloadQueue:
             prev = self._items.get(key)
             if prev is not None and not url:
                 url = prev.url
+            if peer_id is _UNSET:
+                peer_id = prev.peer_id if prev is not None else None
+            else:
+                peer_id = canonical_peer_id(peer_id)
+            if message_id is _UNSET:
+                message_id = prev.message_id if prev is not None else None
+            elif message_id is not None:
+                try:
+                    message_id = int(message_id)
+                except (TypeError, ValueError):
+                    message_id = prev.message_id if prev is not None else None
+            if document_id is _UNSET:
+                document_id = prev.document_id if prev is not None else None
+            elif document_id is not None:
+                try:
+                    document_id = int(document_id)
+                except (TypeError, ValueError):
+                    document_id = prev.document_id if prev is not None else None
+            if save_path is _UNSET:
+                save_path = prev.save_path if prev is not None else ""
+            else:
+                save_path = str(save_path or "")
+            changed = prev is None or any(
+                (
+                    prev.name != name,
+                    prev.status != status,
+                    prev.url != url,
+                    prev.error != error,
+                    prev.peer_id != peer_id,
+                    prev.message_id != message_id,
+                    prev.document_id != document_id,
+                    prev.save_path != save_path,
+                    key not in self._order,
+                )
+            )
             self._items[key] = QueueTask(
                 key=key,
                 name=name,
@@ -1892,12 +2114,49 @@ class DownloadQueue:
                 current=current,
                 total=total,
                 speed=speed,
+                peer_id=peer_id,
+                message_id=message_id,
+                document_id=document_id,
+                save_path=save_path,
             )
             if key not in self._order:
                 if index is None or index >= len(self._order):
                     self._order.append(key)
                 else:
                     self._order.insert(index, key)
+            # 进度数字经常变，不为此反复写盘。状态和身份变了才保存。
+            if changed:
+                self._save_locked()
+
+    def note_identity(
+        self,
+        key: str,
+        *,
+        peer_id: Any = None,
+        message_id: Any = None,
+        document_id: Any = None,
+        save_path: Any = None,
+    ) -> None:
+        with self._lock:
+            item = self._items.get(key)
+            if item is None or key in self._cancelled:
+                return
+            name, status, url, error = item.name, item.status, item.url, item.error
+            current, total, speed = item.current, item.total, item.speed
+        self.upsert(
+            key,
+            name,
+            status,
+            url=url,
+            error=error,
+            current=current,
+            total=total,
+            speed=speed,
+            peer_id=item.peer_id if peer_id is None else peer_id,
+            message_id=item.message_id if message_id is None else message_id,
+            document_id=item.document_id if document_id is None else document_id,
+            save_path=item.save_path if save_path is None else save_path,
+        )
 
     def replace(self, old: str, items: list[tuple[str, str, int, str]]) -> None:
         """用一组子任务替换占位链接。old 若已取消，则子任务也视为取消。"""
@@ -1906,6 +2165,7 @@ class DownloadQueue:
                 for key, _name, _total, _url in items:
                     self._cancelled.add(key)
                 self._drop_locked(old)
+                self._save_locked()
                 return
             idx = self._order.index(old) if old in self._order else len(self._order)
             parent = self._items.get(old)
@@ -1913,8 +2173,16 @@ class DownloadQueue:
             for offset, (key, name, total, url) in enumerate(items):
                 if not url and parent is not None:
                     url = parent.url
-                self._items[key] = QueueTask(key=key, name=name, status="queued", url=url, total=total)
+                self._items[key] = QueueTask(
+                    key=key,
+                    name=name,
+                    status="queued",
+                    url=url,
+                    total=total,
+                    peer_id=parent.peer_id if parent is not None else None,
+                )
                 self._order.insert(idx + offset, key)
+            self._save_locked()
 
     def remove(self, key: str) -> str:
         """删除一行。排队中或下载中会先标记取消。返回 removed / cancelled / missing。"""
@@ -1922,9 +2190,11 @@ class DownloadQueue:
             item = self._items.get(key)
             self._cancelled.add(key)
             if item is None:
+                self._save_locked()
                 return "missing"
             status = item.status
             self._drop_locked(key)
+            self._save_locked()
             if status in ("running", "queued"):
                 return "cancelled"
             return "removed"
@@ -1936,11 +2206,171 @@ class DownloadQueue:
                 if item.status in ("queued", "running", "paused"):
                     item.status = "stopped"
                     item.speed = 0.0
+            self._save_locked()
+
+    def prepare_for_exit(self) -> None:
+        """退出前把正在下载的改成已停止并写盘。"""
+        with self._lock:
+            for item in self._items.values():
+                if item.status in ("running", "paused"):
+                    item.status = "stopped"
+                    item.speed = 0.0
+                    if not (item.error or "").strip():
+                        item.error = INTERRUPTED_TASK_HINT
+            self._save_locked()
 
     def _drop_locked(self, key: str) -> None:
         self._items.pop(key, None)
         if key in self._order:
             self._order.remove(key)
+
+    def _save_locked(self) -> None:
+        if self._persist_path is None:
+            return
+        try:
+            _atomic_write_json(self._persist_path, _queue_payload(self._items, self._order))
+        except OSError:
+            pass
+
+    def _load(self) -> None:
+        if self._persist_path is None or not self._persist_path.is_file():
+            return
+        loaded = load_unfinished_tasks(self._persist_path)
+        with self._lock:
+            self._items.clear()
+            self._order.clear()
+            for task in loaded:
+                self._items[task.key] = task
+                self._order.append(task.key)
+            self._save_locked()
+
+
+def load_download_records(path: Path) -> list[dict]:
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return []
+    rows = raw.get("items") if isinstance(raw, dict) else None
+    if not isinstance(rows, list):
+        return []
+    records: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        message_id = row.get("message_id")
+        try:
+            message_id = int(message_id)
+        except (TypeError, ValueError):
+            continue
+        document_id = row.get("document_id")
+        try:
+            document_id = int(document_id) if document_id is not None else None
+        except (TypeError, ValueError):
+            document_id = None
+        records.append(
+            {
+                "peer_id": canonical_peer_id(row.get("peer_id")),
+                "message_id": message_id,
+                "document_id": document_id,
+                "path": str(row.get("path") or ""),
+                "url": str(row.get("url") or ""),
+            }
+        )
+    return records
+
+
+def record_download(
+    path: Path,
+    *,
+    peer_id: Any,
+    message_id: int,
+    save_path: str,
+    document_id: Optional[int] = None,
+    url: str = "",
+) -> None:
+    """记住一次成功的下载。文件后来被删掉时，记录还在，但不再算已下载。"""
+    peer = canonical_peer_id(peer_id)
+    try:
+        message_id = int(message_id)
+    except (TypeError, ValueError):
+        return
+    if peer is None or not save_path:
+        return
+    records = [row for row in load_download_records(path) if not (
+        row.get("peer_id") == peer and row.get("message_id") == message_id
+    )]
+    records.append(
+        {
+            "peer_id": peer,
+            "message_id": message_id,
+            "document_id": int(document_id) if isinstance(document_id, int) else None,
+            "path": str(save_path),
+            "url": url or "",
+        }
+    )
+    try:
+        _atomic_write_json(Path(path), {"version": 1, "items": records})
+    except OSError:
+        pass
+
+
+def _record_file_exists(record: dict) -> bool:
+    text = str(record.get("path") or "").strip()
+    if not text:
+        return False
+    file = Path(text)
+    try:
+        return file.is_file() and file.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def message_is_downloaded(
+    records: Iterable[dict],
+    *,
+    peer_id: Any,
+    message_id: int,
+    document_ids: Optional[Iterable[int]] = None,
+) -> bool:
+    """同一对话里的同一条消息（或同一个视频文件）且文件还在，才算已下载。
+
+    从对话里下载和从链接下载写的是同一条记录。文件被删掉则视为未下载。
+    """
+    peer = canonical_peer_id(peer_id)
+    try:
+        message_id = int(message_id)
+    except (TypeError, ValueError):
+        return False
+    docs = {int(item) for item in (document_ids or []) if isinstance(item, int)}
+    if peer is None:
+        return False
+    for record in records:
+        if canonical_peer_id(record.get("peer_id")) != peer:
+            continue
+        if not _record_file_exists(record):
+            continue
+        if record.get("message_id") == message_id:
+            return True
+        doc = record.get("document_id")
+        if isinstance(doc, int) and doc in docs:
+            return True
+    return False
+
+
+def apply_downloaded_marks(items: Iterable[VideoItem], peer_id: Any, records: Iterable[dict]) -> None:
+    """给当前对话的视频打上是否已下载。记录可以来自链接或对话下载。"""
+    cached = list(records)
+    for item in items:
+        item.downloaded = message_is_downloaded(
+            cached,
+            peer_id=peer_id,
+            message_id=item.message_id,
+            document_ids=video_item_document_ids(item),
+        )
+
+
+def video_downloaded_label(item: VideoItem) -> str:
+    return "已下载" if item.downloaded else ""
 
 
 class TelegramService:

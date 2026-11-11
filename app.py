@@ -42,6 +42,8 @@ from tgcore import (
     clear_credentials,
     clear_session_only,
     detect_local_proxies,
+    DOWNLOAD_INDEX_PATH,
+    QUEUE_PATH,
     DownloadQueue,
     VideoScanState,
     explain_error,
@@ -52,20 +54,26 @@ from tgcore import (
     format_duration_short,
     format_proxy_label,
     format_speed,
+    apply_downloaded_marks,
+    canonical_peer_id,
     has_api_credentials,
     is_user_stop,
     link_failure_text,
     load_cached_avatar,
     load_config,
+    load_download_records,
     login_dialog_after_session_loss,
     message_video_kind,
     original_media_name,
+    primary_document_id,
     pick_best_proxy,
     pick_video_quality,
     plan_link_jobs,
     proxy_from_config,
     quality_pref_label,
     quality_pref_value,
+    record_download,
+    restored_link_text,
     split_link_text,
     startup_login_target,
     test_proxy_connection,
@@ -709,6 +717,15 @@ class PlaceholderText(tk.Text):
         if self._showing:
             return ""
         return self.get("1.0", "end-1c")
+
+    def set_text(self, text: str) -> None:
+        if text:
+            self._showing = False
+            self.configure(fg=C_TEXT)
+            self.delete("1.0", "end")
+            self.insert("1.0", text)
+        else:
+            self._show_placeholder()
 
 
 class Field(tk.Frame):
@@ -1809,8 +1826,13 @@ class VideoRow(tk.Frame):
         texts.pack(side="left", fill="both", expand=True, padx=(10, 12))
         mid = tk.Frame(texts, bg=C_CARD)
         mid.place(relx=0, rely=0.5, relwidth=1, anchor="w")
+        title_line = tk.Frame(mid, bg=C_CARD)
+        title_line.pack(fill="x")
+        self._title_line = title_line
+        self.lbl_done = tk.Label(title_line, text="", bg=C_CARD, fg=C_OK, font=Fonts.aux, anchor="e")
+        self.lbl_done.pack(side="right")
         self.lbl_title = tk.Label(
-            mid,
+            title_line,
             text=self._title_full,
             bg=C_CARD,
             fg=C_TEXT,
@@ -1818,7 +1840,7 @@ class VideoRow(tk.Frame):
             anchor="w",
             justify="left",
         )
-        self.lbl_title.pack(fill="x")
+        self.lbl_title.pack(side="left", fill="x", expand=True)
         self.lbl_meta = tk.Label(
             mid, text="", bg=C_CARD, fg=C_TEXT3, font=Fonts.aux, anchor="w", justify="left", wraplength=420
         )
@@ -1828,7 +1850,7 @@ class VideoRow(tk.Frame):
         self._quality_pref = QUALITY_HIGHEST
         self.refresh_meta()
 
-        for w in (self, self._chk_box, self.cover, texts, mid, self.lbl_title, self.lbl_meta):
+        for w in (self, self._chk_box, self.cover, texts, mid, title_line, self.lbl_title, self.lbl_done, self.lbl_meta):
             w.bind("<Button-1>", self._click)
         mid.bind("<Configure>", self._on_texts)
         if item.thumb_bytes:
@@ -1838,7 +1860,9 @@ class VideoRow(tk.Frame):
             self._paint_cover()
 
     def _on_texts(self, event: tk.Event) -> None:
-        self.lbl_title.configure(text=elide_text(Fonts.body, self._title_full, max(1, int(event.width))))
+        badge = self.lbl_done.winfo_width() if self.item.downloaded else 0
+        width = max(1, int(event.width) - badge - (8 if badge else 0))
+        self.lbl_title.configure(text=elide_text(Fonts.body, self._title_full, width))
 
     def _meta_text(self, pref: Optional[str] = None) -> str:
         chosen = pick_video_quality(self.item.qualities or [], pref or self._quality_pref)
@@ -1853,7 +1877,11 @@ class VideoRow(tk.Frame):
     def refresh_meta(self, pref: Optional[str] = None) -> None:
         if pref is not None:
             self._quality_pref = pref
+        self.lbl_done.configure(text="已下载" if self.item.downloaded else "")
         self.lbl_meta.configure(text=self._meta_text())
+        width = self._mid.winfo_width() if self._mid.winfo_exists() else 0
+        if width > 20:
+            self._on_texts(type("E", (), {"width": width})())
 
     def _paint_cover(self) -> None:
         bg = C_SEL if self.selected else C_CARD
@@ -1908,7 +1936,9 @@ class VideoRow(tk.Frame):
         self.cover.configure(bg=bg)
         self._texts.configure(bg=bg)
         self._mid.configure(bg=bg)
+        self._title_line.configure(bg=bg)
         self.lbl_title.configure(bg=bg)
+        self.lbl_done.configure(bg=bg)
         self.lbl_meta.configure(bg=bg)
         self.chk.set_bg(bg)
         self.chk.set_checked(selected)
@@ -1996,6 +2026,10 @@ class VideoList(tk.Frame):
         for row in self._rows.values():
             row.refresh_meta(pref)
 
+    def refresh_download_marks(self) -> None:
+        for row in self._rows.values():
+            row.refresh_meta()
+
 
 class TaskRow(tk.Frame):
     def __init__(self, master: tk.Misc, on_remove: Optional[Callable[[str], None]] = None) -> None:
@@ -2052,7 +2086,7 @@ class TaskRow(tk.Frame):
             bar_color = C_ERR
         elif status == "stopped":
             self.lbl_stat.configure(text="已停止", fg=C_TEXT2)
-            self.lbl_sub.configure(text="", fg=C_TEXT3)
+            self.lbl_sub.configure(text=error or "", fg=C_TEXT3)
             self.lbl_pct.configure(text="")
             pct = int(current * 100 / total) if total else 0
             bar_color = C_TEXT3
@@ -2585,7 +2619,7 @@ class App(tk.Tk):
         self._video_scan = VideoScanState()
         self._video_notices: list[str] = []
         self._task_gen = 0
-        self.queue = DownloadQueue()
+        self.queue = DownloadQueue(persist_path=QUEUE_PATH)
         self._phone_pending: Optional[str] = None
         self._awaiting_password = False
         self._logged_in = False
@@ -2601,6 +2635,7 @@ class App(tk.Tk):
         Fonts.init(self)
         self._build_style()
         self._build_ui()
+        self._restore_unfinished_downloads()
         self._build_login_dialogs()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(80, self._drain_ui_queue)
@@ -3401,6 +3436,44 @@ class App(tk.Tk):
 
     # ----------------------------------------------------------- bootstrap
 
+    def _restore_unfinished_downloads(self) -> None:
+        tasks = [self.queue.get(key) for key in self.queue.keys()]
+        tasks = [task for task in tasks if task is not None]
+        if not tasks:
+            return
+        self._mirror_queue()
+        text = restored_link_text(tasks)
+        if text and hasattr(self, "txt_links"):
+            self.txt_links.set_text(text)
+        self.tasks.set_header(f"已恢复 {len(tasks)} 条未完成下载", show_stop=False)
+        self._log(f"已恢复 {len(tasks)} 条未完成下载。关闭前正在下载的已改为停止，不会自动继续。")
+
+    def _download_records(self) -> list[dict]:
+        return load_download_records(DOWNLOAD_INDEX_PATH)
+
+    def _remember_download(self, peer_id: Any, message: Any, path: Path, url: str = "") -> None:
+        peer = canonical_peer_id(peer_id)
+        message_id = getattr(message, "id", None)
+        if peer is None or not isinstance(message_id, int):
+            return
+        record_download(
+            DOWNLOAD_INDEX_PATH,
+            peer_id=peer,
+            message_id=message_id,
+            save_path=str(path),
+            document_id=primary_document_id(message),
+            url=url,
+        )
+        self._refresh_download_marks()
+
+    def _refresh_download_marks(self) -> None:
+        chat = getattr(self, "_video_chat", None)
+        if chat is None or not getattr(self, "_video_items", None):
+            return
+        apply_downloaded_marks(self._video_items, chat.id, self._download_records())
+        if hasattr(self, "video_list"):
+            self.video_list.refresh_download_marks()
+
     def _bootstrap(self) -> None:
         self._maybe_show_notice()
         self._maybe_autodetect_proxy()
@@ -3940,11 +4013,23 @@ class App(tk.Tk):
         current: int = 0,
         total: int = 0,
         speed: float = 0.0,
+        save_path: str = "",
     ) -> bool:
         if self.queue.cancelled(key):
             return False
+        extra: dict[str, Any] = {}
+        if save_path:
+            extra["save_path"] = save_path
         self.queue.upsert(
-            key, name, status, url=url, error=error, current=current, total=total, speed=speed
+            key,
+            name,
+            status,
+            url=url,
+            error=error,
+            current=current,
+            total=total,
+            speed=speed,
+            **extra,
         )
         self._ui(lambda k=key: self._paint_task(k))
         return True
@@ -4035,6 +4120,14 @@ class App(tk.Tk):
                 ]
                 # 队列立刻替换，避免用户点删除时界面还停在旧的占位行。
                 self.queue.replace(key, replacements)
+                peer = canonical_peer_id(entity)
+                for msg, _kind in videos:
+                    self.queue.note_identity(
+                        f"{gen}-link-{li}-msg-{msg.id}",
+                        peer_id=peer,
+                        message_id=getattr(msg, "id", None),
+                        document_id=primary_document_id(msg),
+                    )
                 self._ui(lambda old=key, items=replacements: self._paint_replaced_link(old, items))
                 self._ui_log(f"对话：{title} · 消息 {message.id} · 发现 {len(videos)} 个视频媒体")
                 for idx, (msg, kind) in enumerate(videos, 1):
@@ -4063,7 +4156,10 @@ class App(tk.Tk):
                             continue
                         ok += 1
                         size = path.stat().st_size if path.exists() else (message_file_size(msg) or 0)
-                        self._set_task(child, name, "done", url=parsed.raw, current=size, total=size)
+                        self._remember_download(entity, msg, path, url=parsed.raw)
+                        self._set_task(
+                            child, name, "done", url=parsed.raw, current=size, total=size, save_path=str(path)
+                        )
                         self._ui_log(f"✓ 已保存：{path.name}（{parsed.raw}）")
                     except Exception as exc:
                         if self.queue.cancelled(child):
@@ -4170,6 +4266,8 @@ class App(tk.Tk):
         if gen != self._video_gen or self._video_chat is None or self._video_chat.id != item.id:
             return
         videos = list(page.items)
+        if self._video_chat is not None:
+            apply_downloaded_marks(videos, self._video_chat.id, self._download_records())
         self._video_loading = False
         self._video_scan = page.state
         self._video_notices = list(page.notices)
@@ -4261,7 +4359,7 @@ class App(tk.Tk):
         assert self.service
         entity = await self.service.resolve_entity(item.entity)
         title = item.title or self.service.entity_title(entity)
-        await self._download_message_list(entity, title, messages, folder)
+        await self._download_message_list(entity, title, messages, folder, peer_id=item.id)
 
     async def _download_message_list(
         self,
@@ -4269,6 +4367,7 @@ class App(tk.Tk):
         title: str,
         messages: list[Any],
         folder: Path,
+        peer_id: Any = None,
     ) -> None:
         total = len(messages)
         self._ui_log(f"准备下载 {total} 个视频媒体 → {folder}")
@@ -4280,6 +4379,14 @@ class App(tk.Tk):
             name = task_display_name(msg, title)
             rows.append((key, name, "queued", "", "", preferred_media_size(msg, self._quality_pref()) or 0))
         self._seed_tasks(rows)
+        peer = canonical_peer_id(peer_id if peer_id is not None else entity)
+        for msg in messages:
+            self.queue.note_identity(
+                f"{gen}-msg-{msg.id}",
+                peer_id=peer,
+                message_id=getattr(msg, "id", None),
+                document_id=primary_document_id(msg),
+            )
         ok = fail = 0
         for idx, msg in enumerate(messages, 1):
             key = f"{gen}-msg-{msg.id}"
@@ -4299,7 +4406,8 @@ class App(tk.Tk):
                     continue
                 ok += 1
                 size = path.stat().st_size if path.exists() else (message_file_size(msg) or 0)
-                self._set_task(key, name, "done", current=size, total=size)
+                self._remember_download(peer, msg, path)
+                self._set_task(key, name, "done", current=size, total=size, save_path=str(path))
                 self._ui_log(f"✓ [{idx}/{total}] {path.name}")
             except Exception as exc:
                 if self.queue.cancelled(key):
@@ -4651,6 +4759,10 @@ class App(tk.Tk):
             if not messagebox.askyesno(APP_NAME, "还有下载任务在进行。确定要退出吗？未下完的文件不会保留。"):
                 return
         self._exiting = True
+        try:
+            self.queue.prepare_for_exit()
+        except Exception:
+            pass
         self._stop_tray()
         self._stop_flag.set()
         # 先立刻隐去窗口，并用看门狗保证进程一定退出，避免安装包仍检测到残留进程

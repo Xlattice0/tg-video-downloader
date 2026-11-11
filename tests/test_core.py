@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from telethon.errors import FloodWaitError
 from telethon.tl.types import (
     Document,
+    PeerChannel,
     DocumentAttributeAnimated,
     DocumentAttributeFilename,
     DocumentAttributeSticker,
@@ -31,10 +32,14 @@ from telethon.tl.types import (
 from tgcore import (
     DialogItem,
     DownloadQueue,
+    INTERRUPTED_TASK_HINT,
     UserFacingError,
+    VideoItem,
     VideoScanState,
     _normalize_phone,
+    apply_downloaded_marks,
     build_save_name,
+    canonical_peer_id,
     classify_video_message,
     dialog_kind,
     dialog_title,
@@ -47,6 +52,8 @@ from tgcore import (
     is_user_stop,
     link_failure_text,
     list_video_qualities,
+    load_download_records,
+    load_unfinished_tasks,
     login_dialog_after_session_loss,
     parse_telegram_link,
     pick_best_proxy,
@@ -54,6 +61,8 @@ from tgcore import (
     plan_link_jobs,
     proxy_from_config,
     quality_pref_label,
+    record_download,
+    restored_link_text,
     quality_pref_value,
     sanitize_filename,
     snap_quality_height,
@@ -61,6 +70,7 @@ from tgcore import (
     startup_login_target,
     unique_path,
     validate_proxy_settings,
+    video_downloaded_label,
     visible_chat_selection,
 )
 
@@ -576,6 +586,124 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(format_duration_short(None), "—")
         self.assertEqual(format_duration_short(90), "01:30")
         self.assertEqual(format_duration_short(3661), "1:01:01")
+
+
+def _video_item(message_id: int, document_id: int | None = None) -> VideoItem:
+    return VideoItem(
+        message_id=message_id,
+        date=None,
+        duration=3,
+        size=100,
+        filename="clip.mp4",
+        caption="标题",
+        kind="video",
+        document_id=document_id,
+    )
+
+
+class PersistenceTests(unittest.TestCase):
+    def test_unfinished_queue_survives_restart_and_running_becomes_stopped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "download_queue.json"
+            queue = DownloadQueue(persist_path=path)
+            queue.upsert("bad", "https://t.me/nope", "error", url="https://t.me/nope", error="链接 https://t.me/nope：不是帖子链接")
+            queue.upsert("wait", "https://t.me/demo/1", "queued", url="https://t.me/demo/1")
+            queue.upsert("run", "https://t.me/demo/2", "running", url="https://t.me/demo/2", current=40, total=100)
+            queue.note_identity("run", peer_id=-100123456, message_id=2, document_id=77)
+            queue.upsert("pause", "https://t.me/demo/3", "paused", url="https://t.me/demo/3")
+            queue.upsert("stop", "https://t.me/demo/4", "stopped", url="https://t.me/demo/4")
+            queue.upsert("done", "https://t.me/demo/5", "done", url="https://t.me/demo/5", save_path=str(Path(tmp) / "done.mp4"))
+
+            # 进度数字变化不应把「正在下载」写成已完成
+            queue.upsert("run", "https://t.me/demo/2", "running", url="https://t.me/demo/2", current=80, total=100)
+            restored = DownloadQueue(persist_path=path)
+            self.assertEqual(restored.keys(), ["bad", "wait", "run", "pause", "stop"])
+            self.assertNotIn("done", restored.keys())
+            self.assertEqual(restored.get("wait").status, "queued")
+            self.assertEqual(restored.get("run").status, "stopped")
+            self.assertEqual(restored.get("run").error, INTERRUPTED_TASK_HINT)
+            self.assertEqual(restored.get("run").peer_id, -100123456)
+            self.assertEqual(restored.get("run").message_id, 2)
+            self.assertEqual(restored.get("run").document_id, 77)
+            self.assertNotEqual(restored.get("run").status, "running")
+            self.assertEqual(restored.get("pause").status, "stopped")
+            self.assertEqual(restored.get("stop").status, "stopped")
+            self.assertIn("https://t.me/nope", restored.get("bad").error)
+            self.assertEqual(restored.get("bad").status, "error")
+            text = restored_link_text([restored.get(key) for key in restored.keys()])
+            self.assertIn("https://t.me/demo/2", text)
+            self.assertIn("https://t.me/nope", text)
+
+            queue.remove("wait")
+            again = load_unfinished_tasks(path)
+            self.assertNotIn("wait", [task.key for task in again])
+
+            path.write_text("{", encoding="utf-8")
+            self.assertEqual(load_unfinished_tasks(path), [])
+
+    def test_prepare_for_exit_stops_the_active_download(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "download_queue.json"
+            queue = DownloadQueue(persist_path=path)
+            queue.upsert("run", "https://t.me/demo/9", "running", url="https://t.me/demo/9")
+            queue.prepare_for_exit()
+            self.assertEqual(queue.get("run").status, "stopped")
+            self.assertIn("未下完", queue.get("run").error)
+            reloaded = DownloadQueue(persist_path=path)
+            self.assertEqual(reloaded.get("run").status, "stopped")
+
+    def test_downloaded_mark_from_link_and_chat_and_deleted_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            index = Path(tmp) / "downloads_index.json"
+            folder = Path(tmp)
+            link_file = folder / "from-link.mp4"
+            chat_file = folder / "from-chat.mp4"
+            link_file.write_bytes(b"link-bytes")
+            chat_file.write_bytes(b"chat-bytes")
+            peer = canonical_peer_id(PeerChannel(channel_id=123456))
+            # Telethon 的频道 id 是 -(10**12 + 频道号)，对话列表和解析后的实体都用这个值。
+            self.assertEqual(peer, -(10**12 + 123456))
+            self.assertEqual(canonical_peer_id(peer), peer)
+            self.assertEqual(canonical_peer_id(DialogItem(entity=None, title="频道", kind="频道", id=peer)), peer)
+
+            # 粘贴链接下载
+            record_download(
+                index,
+                peer_id=peer,
+                message_id=8,
+                save_path=str(link_file),
+                document_id=42,
+                url="https://t.me/c/123456/8",
+            )
+            # 从对话列表下载的是另一条消息
+            record_download(
+                index,
+                peer_id=DialogItem(entity=None, title="频道", kind="频道", id=peer),
+                message_id=9,
+                save_path=str(chat_file),
+                document_id=43,
+                url="",
+            )
+            records = load_download_records(index)
+            items = [_video_item(8, 42), _video_item(9, 43), _video_item(10, 99), _video_item(77, 42)]
+            apply_downloaded_marks(items, peer, records)
+            self.assertTrue(items[0].downloaded)
+            self.assertTrue(items[1].downloaded)
+            self.assertFalse(items[2].downloaded)
+            # 同一对话里文档 id 相同，也算已下载（链接和列表看到的是同一个文件）
+            self.assertTrue(items[3].downloaded)
+            self.assertEqual(video_downloaded_label(items[0]), "已下载")
+            self.assertEqual(video_downloaded_label(items[2]), "")
+
+            other_chat = [_video_item(8, 42)]
+            apply_downloaded_marks(other_chat, -100999, records)
+            self.assertFalse(other_chat[0].downloaded)
+
+            link_file.unlink()
+            apply_downloaded_marks(items, peer, load_download_records(index))
+            self.assertFalse(items[0].downloaded)
+            # 对话里另存的那条文件还在
+            self.assertTrue(items[1].downloaded)
 
 
 if __name__ == "__main__":
