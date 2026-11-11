@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Build TGVideoDownloader.exe with PyInstaller (1.3.15)."""
+"""Build TGVideoDownloader.exe with PyInstaller (1.3.16)."""
 from __future__ import annotations
 
 import subprocess

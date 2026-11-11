@@ -42,7 +42,10 @@ from tgcore import (
     clear_credentials,
     clear_session_only,
     detect_local_proxies,
+    DownloadQueue,
+    VideoScanState,
     explain_error,
+    filter_dialogs,
     format_bytes,
     format_date_short,
     format_datetime,
@@ -50,20 +53,26 @@ from tgcore import (
     format_proxy_label,
     format_speed,
     has_api_credentials,
-    kind_label,
+    is_user_stop,
+    link_failure_text,
     load_cached_avatar,
     load_config,
+    login_dialog_after_session_loss,
     message_video_kind,
     original_media_name,
-    parse_telegram_link,
     pick_best_proxy,
     pick_video_quality,
+    plan_link_jobs,
     proxy_from_config,
     quality_pref_label,
     quality_pref_value,
+    split_link_text,
+    startup_login_target,
     test_proxy_connection,
     update_config,
+    validate_proxy_settings,
     video_display_title,
+    visible_chat_selection,
 )
 
 # ------------------------------------------------------------------ palette
@@ -1810,7 +1819,9 @@ class VideoRow(tk.Frame):
             justify="left",
         )
         self.lbl_title.pack(fill="x")
-        self.lbl_meta = tk.Label(mid, text="", bg=C_CARD, fg=C_TEXT3, font=Fonts.aux, anchor="w")
+        self.lbl_meta = tk.Label(
+            mid, text="", bg=C_CARD, fg=C_TEXT3, font=Fonts.aux, anchor="w", justify="left", wraplength=420
+        )
         self.lbl_meta.pack(fill="x", pady=(4, 0))
         self._texts = texts
         self._mid = mid
@@ -1833,6 +1844,10 @@ class VideoRow(tk.Frame):
         chosen = pick_video_quality(self.item.qualities or [], pref or self._quality_pref)
         size = chosen.size if chosen else self.item.size
         parts = [format_bytes(size), format_date_short(self.item.date)]
+        if self.item.note:
+            parts.append(self.item.note)
+        elif not self.item.downloadable:
+            parts.append("无法下载")
         return " · ".join(p for p in parts if p)
 
     def refresh_meta(self, pref: Optional[str] = None) -> None:
@@ -1983,20 +1998,26 @@ class VideoList(tk.Frame):
 
 
 class TaskRow(tk.Frame):
-    def __init__(self, master: tk.Misc) -> None:
+    def __init__(self, master: tk.Misc, on_remove: Optional[Callable[[str], None]] = None) -> None:
         super().__init__(master, bg=C_CARD)
         self.key = ""
+        self._on_remove = on_remove
         top = tk.Frame(self, bg=C_CARD)
         top.pack(fill="x", padx=12, pady=(10, 0))
         self.lbl_name = tk.Label(top, text="", bg=C_CARD, fg=C_TEXT, font=Fonts.body, anchor="w")
         self.lbl_name.pack(side="left", fill="x", expand=True)
+        self.btn_remove = tk.Label(top, text="删除", bg=C_CARD, fg=C_ACCENT, font=Fonts.aux, cursor="hand2")
+        self.btn_remove.pack(side="right")
+        self.btn_remove.bind("<Button-1>", self._remove_clicked)
         self.lbl_stat = tk.Label(top, text="", bg=C_CARD, fg=C_TEXT2, font=Fonts.aux, anchor="e")
-        self.lbl_stat.pack(side="right")
+        self.lbl_stat.pack(side="right", padx=(0, 10))
 
         mid = tk.Frame(self, bg=C_CARD)
         mid.pack(fill="x", padx=12, pady=(2, 0))
-        self.lbl_sub = tk.Label(mid, text="", bg=C_CARD, fg=C_TEXT3, font=Fonts.aux, anchor="w")
-        self.lbl_sub.pack(side="left")
+        self.lbl_sub = tk.Label(
+            mid, text="", bg=C_CARD, fg=C_TEXT3, font=Fonts.aux, anchor="w", justify="left", wraplength=420
+        )
+        self.lbl_sub.pack(side="left", fill="x", expand=True)
         self.lbl_pct = tk.Label(mid, text="", bg=C_CARD, fg=C_TEXT2, font=Fonts.aux, anchor="e")
         self.lbl_pct.pack(side="right")
 
@@ -2019,26 +2040,26 @@ class TaskRow(tk.Frame):
         self.lbl_name.configure(text=name, fg=C_TEXT2 if status == "done" else C_TEXT)
         if status == "done":
             self.lbl_stat.configure(text="已完成", fg=C_OK)
-            self.lbl_sub.configure(text=format_bytes(total or current) if (total or current) else "")
+            self.lbl_sub.configure(text=format_bytes(total or current) if (total or current) else "", fg=C_TEXT3)
             self.lbl_pct.configure(text="100%", fg=C_TEXT2)
             pct = 100
             bar_color = C_OK
         elif status == "error":
             self.lbl_stat.configure(text="失败", fg=C_ERR)
-            self.lbl_sub.configure(text=error or "")
+            self.lbl_sub.configure(text=error or "", fg=C_ERR)
             self.lbl_pct.configure(text="")
             pct = int(current * 100 / total) if total else 0
             bar_color = C_ERR
         elif status == "stopped":
             self.lbl_stat.configure(text="已停止", fg=C_TEXT2)
-            self.lbl_sub.configure(text="")
+            self.lbl_sub.configure(text="", fg=C_TEXT3)
             self.lbl_pct.configure(text="")
             pct = int(current * 100 / total) if total else 0
             bar_color = C_TEXT3
         elif status == "queued":
             size = f"{format_bytes(total)}" if total else ""
             self.lbl_stat.configure(text=size, fg=C_TEXT2)
-            self.lbl_sub.configure(text="排队中")
+            self.lbl_sub.configure(text="排队中", fg=C_TEXT3)
             self.lbl_pct.configure(text="0%" if not current else f"{int(current * 100 / total) if total else 0}%")
             pct = int(current * 100 / total) if total else 0
             bar_color = C_ACCENT
@@ -2049,7 +2070,7 @@ class TaskRow(tk.Frame):
             else:
                 self.lbl_stat.configure(text=format_bytes(current) if current else "", fg=C_TEXT2)
                 pct = 0
-            self.lbl_sub.configure(text=format_speed(speed) if speed else "下载中")
+            self.lbl_sub.configure(text=format_speed(speed) if speed else "下载中", fg=C_TEXT3)
             self.lbl_pct.configure(text=f"{pct}%")
             bar_color = C_ACCENT
         self._draw_bar(pct, bar_color)
@@ -2065,6 +2086,11 @@ class TaskRow(tk.Frame):
         if fw:
             self.bar.create_rectangle(0, 0, fw, h, fill=color, outline=color)
 
+    def _remove_clicked(self, _event: tk.Event | None = None) -> str | None:
+        if self._on_remove and self.key:
+            self._on_remove(self.key)
+        return "break"
+
 
 class TaskList(tk.Frame):
     def __init__(
@@ -2073,6 +2099,7 @@ class TaskList(tk.Frame):
         on_stop: Callable[[], None],
         on_open_folder: Optional[Callable[[], None]] = None,
         on_close: Optional[Callable[[], None]] = None,
+        on_remove: Optional[Callable[[str], None]] = None,
     ) -> None:
         super().__init__(
             master,
@@ -2084,6 +2111,7 @@ class TaskList(tk.Frame):
         self._on_stop = on_stop
         self._on_open_folder = on_open_folder
         self._on_close = on_close
+        self._on_remove = on_remove
         self._items: dict[str, dict[str, Any]] = {}
         self._order: list[str] = []
         self._rows: dict[str, TaskRow] = {}
@@ -2236,7 +2264,7 @@ class TaskList(tk.Frame):
         self._show_empty(False)
         row = self._rows.get(key)
         if row is None:
-            row = TaskRow(self.scroll.inner)
+            row = TaskRow(self.scroll.inner, on_remove=self._on_remove)
             row.key = key
             self._rows[key] = row
             self._repack()
@@ -2554,7 +2582,10 @@ class App(tk.Tk):
         self._video_gen = 0
         self._video_loading = False
         self._video_has_more = False
-        self._video_offset_id = 0
+        self._video_scan = VideoScanState()
+        self._video_notices: list[str] = []
+        self._task_gen = 0
+        self.queue = DownloadQueue()
         self._phone_pending: Optional[str] = None
         self._awaiting_password = False
         self._logged_in = False
@@ -2697,7 +2728,12 @@ class App(tk.Tk):
         self._build_link_page()
         self._build_chat_page()
 
-        self.tasks = TaskList(self.main, on_stop=self._request_stop, on_open_folder=self._open_folder)
+        self.tasks = TaskList(
+            self.main,
+            on_stop=self._request_stop,
+            on_open_folder=self._open_folder,
+            on_remove=self._on_remove_task,
+        )
         self.tasks.grid(row=2, column=0, sticky="nsew", padx=16, pady=(10, 0))
         self.main.rowconfigure(2, weight=1)
 
@@ -2884,7 +2920,8 @@ class App(tk.Tk):
         self._video_items = []
         self._video_loading = False
         self._video_has_more = False
-        self._video_offset_id = 0
+        self._video_scan = VideoScanState()
+        self._video_notices = []
         self.video_list.clear()
         if self.video_header.winfo_ismapped():
             self.video_header.grid_forget()
@@ -2913,7 +2950,11 @@ class App(tk.Tk):
             self.chk_select_all.set_state("off")
         self.chk_select_all.set_enabled(has_items)
         if self._video_chat is not None and not (self._video_loading and not has_items):
-            self.lbl_video_count.configure(text=f"{len(self._video_items)} 个视频")
+            note_n = len(getattr(self, "_video_notices", []) or [])
+            text = f"{len(self._video_items)} 个视频"
+            if note_n:
+                text += f" · {note_n} 条说明"
+            self.lbl_video_count.configure(text=text)
         else:
             self.lbl_video_count.configure(text="")
         more_ok = can_act and self._video_chat is not None and self._video_has_more and not self._video_loading
@@ -3363,7 +3404,7 @@ class App(tk.Tk):
     def _bootstrap(self) -> None:
         self._maybe_show_notice()
         self._maybe_autodetect_proxy()
-        if not has_api_credentials(self.cfg):
+        if startup_login_target(has_credentials=has_api_credentials(self.cfg), authorized=False) == "api":
             self._set_logged_in_state(False)
             self._show_dialog(self.dlg_api)
             return
@@ -3496,9 +3537,16 @@ class App(tk.Tk):
         self._set_logged_in_state(False)
         self._log("需要登录账号。可点左侧边栏「登录」，或现在完成手机号验证。")
         # 若用户已经在输入手机号/验证码，不要把窗口切回去
-        if self._phone_pending or self._login_dialog_open(self.dlg_code, self.dlg_2fa, self.dlg_api):
-            return
-        if not self._login_dialog_open(self.dlg_phone):
+        target = startup_login_target(
+            has_credentials=has_api_credentials(self.cfg),
+            authorized=False,
+            phone_pending=bool(self._phone_pending),
+            code_dialog=self._login_dialog_open(self.dlg_code),
+            password_dialog=self._login_dialog_open(self.dlg_2fa),
+            api_dialog=self._login_dialog_open(self.dlg_api),
+            phone_dialog=self._login_dialog_open(self.dlg_phone),
+        )
+        if target == "phone":
             self._show_dialog(self.dlg_phone)
 
     def _login_dialog_open(self, *dialogs: ModalDialog) -> bool:
@@ -3517,10 +3565,8 @@ class App(tk.Tk):
             messagebox.showwarning(APP_NAME, msg + "\n\n将清除本机会话，请重新登录。api_id 和代理设置会保留。")
             clear_session_only()
             self.cfg = load_config()
-            if has_api_credentials(self.cfg):
-                self._show_dialog(self.dlg_phone)
-            else:
-                self._show_dialog(self.dlg_api)
+            target = login_dialog_after_session_loss(has_api_credentials(self.cfg))
+            self._show_dialog(self.dlg_phone if target == "phone" else self.dlg_api)
         else:
             messagebox.showerror(APP_NAME, msg)
 
@@ -3561,20 +3607,10 @@ class App(tk.Tk):
     def _refresh_chat_list(self) -> None:
         if not hasattr(self, "chat_list"):
             return
-        q = (self.ent_search.get() if hasattr(self, "ent_search") else self.var_search.get() or "").strip().lower()
+        q = (self.ent_search.get() if hasattr(self, "ent_search") else self.var_search.get() or "").strip()
         kind = getattr(self, "_chat_filter", "全部")
-        items: list[DialogItem] = []
-        for d in self._dialogs:
-            if kind != "全部" and d.kind != kind:
-                continue
-            hay = f"{d.title} {d.kind} {d.id}".lower()
-            if q and q not in hay:
-                continue
-            items.append(d)
-        selected = self._selected_dialog
-        if selected and not any(d.id == selected.id for d in items):
-            # 搜索/筛选时只取消高亮，不改右侧已加载的对话
-            selected = None
+        items = filter_dialogs(self._dialogs, kind, q)
+        selected = visible_chat_selection(self._selected_dialog, items)
         self.chat_list.set_items(items, selected)
         self.chat_list.apply_avatars(self._avatar_bytes, token=self._avatar_gen)
 
@@ -3650,20 +3686,11 @@ class App(tk.Tk):
         kind = (self.var_proxy_type.get() or "none").strip().lower()
         host = (self.var_proxy_host.get() or "").strip() or "127.0.0.1"
         port_s = (self.var_proxy_port.get() or "").strip()
-        if kind not in ("none", "socks5", "http", "off", "direct"):
-            messagebox.showerror(APP_NAME, "代理类型请选择 直连、SOCKS5 或 HTTP。", parent=self.dlg_proxy)
+        try:
+            kind, port = validate_proxy_settings(kind, port_s)
+        except UserFacingError as exc:
+            messagebox.showerror(APP_NAME, str(exc), parent=self.dlg_proxy)
             return
-        if kind in ("none", "off", "direct"):
-            kind = "none"
-            port: Any = port_s
-        else:
-            try:
-                port = int(port_s)
-            except ValueError:
-                port = 0
-            if port <= 0 or port > 65535:
-                messagebox.showerror(APP_NAME, "端口应为 1–65535 之间的数字。", parent=self.dlg_proxy)
-                return
         self.cfg = update_config(
             proxy_type=kind,
             proxy_host=host,
@@ -3838,15 +3865,89 @@ class App(tk.Tk):
         return path
 
     def _collect_links(self) -> list[str]:
-        raw = self.txt_links.get_text()
-        items: list[str] = []
-        seen: set[str] = set()
-        for part in raw.replace(",", " ").split():
-            text = part.strip().strip("，；;")
-            if text and text not in seen:
-                seen.add(text)
-                items.append(text)
-        return items
+        return split_link_text(self.txt_links.get_text())
+
+    def _on_remove_task(self, key: str) -> None:
+        item = self.queue.get(key)
+        label = (item.url or item.name) if item else key
+        action = self.queue.remove(key)
+        self.tasks.remove(key)
+        if action == "cancelled":
+            self._log(f"已取消并移除：{label}")
+        elif action == "removed":
+            self._log(f"已移除：{label}")
+        if not self.tasks.has_items():
+            self.tasks.set_header("就绪", show_stop=self._busy)
+        else:
+            self._refresh_task_header(done=not self._busy)
+
+    def _mirror_queue(self) -> None:
+        selected_keys = set(self.tasks.keys())
+        self.tasks.clear()
+        for key in self.queue.keys():
+            item = self.queue.get(key)
+            if item is None or self.queue.cancelled(key):
+                continue
+            self.tasks.upsert(
+                key,
+                item.name,
+                item.status,
+                current=item.current,
+                total=item.total,
+                speed=item.speed,
+                error=item.error,
+            )
+        del selected_keys
+        self._refresh_task_header(done=not self._busy)
+        self._relayout_tasks()
+
+    def _seed_tasks(self, rows: list[tuple[str, str, str, str, str, int]], *, paint_now: bool = False) -> None:
+        """rows: key, name, status, url, error, total。先写入队列，再刷新界面。"""
+        self.queue.clear()
+        for key, name, status, url, error, total in rows:
+            self.queue.upsert(key, name, status, url=url, error=error, total=total)
+        if paint_now:
+            self._mirror_queue()
+        else:
+            self._ui(self._mirror_queue)
+
+    def _paint_task(self, key: str) -> None:
+        if self.queue.cancelled(key):
+            self.tasks.remove(key)
+            return
+        item = self.queue.get(key)
+        if item is None:
+            self.tasks.remove(key)
+            return
+        self.tasks.upsert(
+            key,
+            item.name,
+            item.status,
+            current=item.current,
+            total=item.total,
+            speed=item.speed,
+            error=item.error,
+        )
+
+    def _set_task(
+        self,
+        key: str,
+        name: str,
+        status: str,
+        *,
+        url: str = "",
+        error: str = "",
+        current: int = 0,
+        total: int = 0,
+        speed: float = 0.0,
+    ) -> bool:
+        if self.queue.cancelled(key):
+            return False
+        self.queue.upsert(
+            key, name, status, url=url, error=error, current=current, total=total, speed=speed
+        )
+        self._ui(lambda k=key: self._paint_task(k))
+        return True
 
     def _on_download_link(self) -> None:
         if self._busy:
@@ -3857,82 +3958,156 @@ class App(tk.Tk):
             messagebox.showwarning(APP_NAME, "请先粘贴帖子链接，多条请换行。")
             return
         try:
-            parsed_list = [parse_telegram_link(link) for link in links]
             folder = self._save_folder()
         except Exception as exc:
             messagebox.showerror(APP_NAME, explain_error(exc))
             return
-        label = "链接下载" if len(parsed_list) == 1 else f"链接下载（{len(parsed_list)} 条）"
-        self._start_task(self._async_download_links(parsed_list, folder), label=label)
+        jobs = plan_link_jobs(links)
+        if not jobs:
+            messagebox.showwarning(APP_NAME, "请先粘贴帖子链接，多条请换行。")
+            return
+        self._task_gen += 1
+        gen = self._task_gen
+        if not any(job.parsed for job in jobs):
+            self._stop_flag.clear()
+            self._seed_tasks(self._link_rows(gen, jobs), paint_now=True)
+            self.tasks.set_header(f"完成：成功 0，失败 {len(jobs)}", show_stop=False)
+            self._log("这些链接都无法识别，没有开始下载。失败的那一条可以点「删除」去掉。")
+            return
+        valid = sum(1 for job in jobs if job.parsed)
+        label = "链接下载" if valid == 1 and len(jobs) == 1 else f"链接下载（{len(jobs)} 条）"
+        self._start_task(self._async_download_links(jobs, folder, gen), label=label)
 
-    async def _async_download_links(self, parsed_list: list[Any], folder: Path) -> None:
+    def _link_rows(self, gen: int, jobs: list[Any]) -> list[tuple[str, str, str, str, str, int]]:
+        rows = []
+        for i, job in enumerate(jobs):
+            key = f"{gen}-link-{i}"
+            if job.error:
+                rows.append((key, job.raw, "error", job.raw, job.error, 0))
+            else:
+                rows.append((key, job.raw, "queued", job.raw, "", 0))
+        return rows
+
+    async def _async_download_links(self, jobs: list[Any], folder: Path, gen: int) -> None:
         assert self.service
         ok = fail = 0
-        total_links = len(parsed_list)
+        total_links = len(jobs)
+        self._seed_tasks(self._link_rows(gen, jobs))
 
-        def _seed() -> None:
-            self.tasks.clear()
-            for i, parsed in enumerate(parsed_list):
-                self.tasks.upsert(f"link-{i}", parsed.raw, "queued")
-            self._refresh_task_header()
-            self._relayout_tasks()
-
-        self._ui(_seed)
-
-        for li, parsed in enumerate(parsed_list):
+        for li, job in enumerate(jobs):
+            key = f"{gen}-link-{li}"
+            if job.error or job.parsed is None:
+                fail += 1
+                if job.error:
+                    self._ui_log(job.error, error=True)
+                continue
             if self._stop_flag.is_set():
                 self._ui_log("已停止。")
-                self._ui(lambda: self._mark_remaining_stopped())
+                self._ui(self._mark_remaining_stopped)
                 break
-            self._ui(lambda k=f"link-{li}", n=parsed.raw: self.tasks.upsert(k, n, "running"))
+            if self.queue.cancelled(key):
+                continue
+            parsed = job.parsed
+            self._set_task(key, parsed.raw, "running", url=parsed.raw)
+            self._ui(self._refresh_task_header)
             self._ui_log(f"解析链接（{li + 1}/{total_links}）：{parsed.raw}")
             try:
                 entity, message = await self.service.resolve_link(parsed)
+                if self.queue.cancelled(key):
+                    continue
                 title = self.service.entity_title(entity)
                 album = await self.service.album_messages(entity, message)
                 videos = [(m, message_video_kind(m)) for m in album if message_video_kind(m)]
                 if not videos:
                     raise UserFacingError(
-                        f"消息 #{message.id}（{title}，{format_datetime(getattr(message, 'date', None))}）"
+                        f"链接 {parsed.raw} · 消息 #{message.id}（{title}，"
+                        f"{format_datetime(getattr(message, 'date', None))}）"
                         f"不含视频 / 圆形视频 / 动态 GIF。"
                     )
                 replacements = [
                     (
-                        f"link-{li}-msg-{msg.id}",
+                        f"{gen}-link-{li}-msg-{msg.id}",
                         task_display_name(msg, title),
                         preferred_media_size(msg, quality_pref_value(self.var_quality.get())) or 0,
+                        parsed.raw,
                     )
                     for msg, _kind in videos
                 ]
-                self._ui(lambda old=f"link-{li}", items=replacements: self.tasks.replace_key(old, items))
+                # 队列立刻替换，避免用户点删除时界面还停在旧的占位行。
+                self.queue.replace(key, replacements)
+                self._ui(lambda old=key, items=replacements: self._paint_replaced_link(old, items))
                 self._ui_log(f"对话：{title} · 消息 {message.id} · 发现 {len(videos)} 个视频媒体")
                 for idx, (msg, kind) in enumerate(videos, 1):
+                    child = f"{gen}-link-{li}-msg-{msg.id}"
                     if self._stop_flag.is_set():
                         self._ui_log("已停止。")
-                        self._ui(lambda: self._mark_remaining_stopped())
+                        self._ui(self._mark_remaining_stopped)
                         return
-                    key = f"link-{li}-msg-{msg.id}"
+                    if self.queue.cancelled(key) or self.queue.cancelled(child):
+                        continue
                     name = task_display_name(msg, title)
                     try:
                         path = await self._download_one(
-                            entity, msg, folder, title, kind, idx, len(videos), task_key=key, display_name=name
+                            entity,
+                            msg,
+                            folder,
+                            title,
+                            kind,
+                            idx,
+                            len(videos),
+                            task_key=child,
+                            display_name=name,
+                            source_url=parsed.raw,
                         )
+                        if self.queue.cancelled(child):
+                            continue
                         ok += 1
                         size = path.stat().st_size if path.exists() else (message_file_size(msg) or 0)
-                        self._ui(lambda k=key, n=name, s=size: self.tasks.upsert(k, n, "done", current=s, total=s))
-                        self._ui_log(f"✓ 已保存：{path.name}")
+                        self._set_task(child, name, "done", url=parsed.raw, current=size, total=size)
+                        self._ui_log(f"✓ 已保存：{path.name}（{parsed.raw}）")
                     except Exception as exc:
+                        if self.queue.cancelled(child):
+                            continue
+                        if is_user_stop(exc):
+                            self._ui_log("已停止。")
+                            self._ui(self._mark_remaining_stopped)
+                            return
                         fail += 1
-                        err = explain_error(exc)
-                        self._ui(lambda k=key, n=name, e=err: self.tasks.upsert(k, n, "error", error=e))
+                        err = link_failure_text(parsed.raw, exc, message_id=getattr(msg, "id", None), title=title)
+                        self._set_task(child, name, "error", url=parsed.raw, error=err)
                         self._ui_log(err, error=True)
             except Exception as exc:
+                if self.queue.cancelled(key):
+                    continue
+                if is_user_stop(exc):
+                    self._ui_log("已停止。")
+                    self._ui(self._mark_remaining_stopped)
+                    break
                 fail += 1
-                err = explain_error(exc)
-                self._ui(lambda k=f"link-{li}", n=parsed.raw, e=err: self.tasks.upsert(k, n, "error", error=e))
+                err = link_failure_text(job.raw, exc)
+                self._set_task(key, job.raw, "error", url=job.raw, error=err)
                 self._ui_log(err, error=True)
         self._ui(lambda: self._refresh_task_header(done=True, ok=ok, fail=fail))
         self._ui_log(f"完成：成功 {ok}，失败 {fail}。保存目录：{folder}")
+
+    def _paint_replaced_link(self, old: str, items: list[tuple[str, str, int, str]]) -> None:
+        self.tasks.remove(old)
+        if self.queue.cancelled(old):
+            return
+        for key, name, total, _url in items:
+            if self.queue.cancelled(key):
+                continue
+            current = self.queue.get(key)
+            status = current.status if current else "queued"
+            shown_total = current.total if current else total
+            self.tasks.upsert(
+                key,
+                current.name if current else name,
+                status,
+                total=shown_total,
+                current=current.current if current else 0,
+                error=current.error if current else "",
+            )
 
     def _start_load_videos(self, item: DialogItem, reset: bool = True) -> None:
         if not self.service:
@@ -3941,7 +4116,8 @@ class App(tk.Tk):
         self._video_chat = item
         if reset:
             self._video_items = []
-            self._video_offset_id = 0
+            self._video_scan = VideoScanState()
+            self._video_notices = []
             self._video_has_more = True
             self.video_list.clear()
             self._video_gen += 1
@@ -3951,15 +4127,15 @@ class App(tk.Tk):
         if reset:
             self._show_video_empty("正在加载视频…")
         self._sync_chat_actions()
-        offset_id = 0 if reset else self._video_offset_id
+        state = self._video_scan
         self._run_async(
-            self._async_list_videos(item, gen, offset_id),
+            self._async_list_videos(item, gen, state),
             on_error=lambda exc, g=gen: self._on_videos_error(g, exc),
         )
 
-    async def _async_list_videos(self, item: DialogItem, gen: int, offset_id: int) -> None:
+    async def _async_list_videos(self, item: DialogItem, gen: int, state: VideoScanState) -> None:
         assert self.service
-        videos = await self.service.list_chat_videos(item.entity, limit=30, offset_id=offset_id)
+        page = await self.service.list_chat_videos(item.entity, limit=30, state=state)
 
         loop = asyncio.get_running_loop()
         applied = loop.create_future()
@@ -3967,7 +4143,7 @@ class App(tk.Tk):
         def _apply() -> None:
             try:
                 if gen == self._video_gen:
-                    self._apply_video_page(item, gen, videos)
+                    self._apply_video_page(item, gen, page)
             finally:
                 if not applied.done():
                     loop.call_soon_threadsafe(applied.set_result, None)
@@ -3977,9 +4153,11 @@ class App(tk.Tk):
         if gen != self._video_gen:
             return
         # 压缩/缓存图只作占位；这里再拉最大静帧封面。切换对话后由 generation 丢弃过期结果。
-        for v in videos:
+        for v in page.items:
             if gen != self._video_gen:
                 return
+            if not v.downloadable:
+                continue
             try:
                 data = await self.service.download_video_thumb(v)
             except Exception:
@@ -3988,30 +4166,42 @@ class App(tk.Tk):
                 continue
             self._ui(lambda mid=v.message_id, b=data, g=gen: self._apply_video_thumb(g, mid, b))
 
-    def _apply_video_page(self, item: DialogItem, gen: int, videos: list[VideoItem]) -> None:
+    def _apply_video_page(self, item: DialogItem, gen: int, page: Any) -> None:
         if gen != self._video_gen or self._video_chat is None or self._video_chat.id != item.id:
             return
+        videos = list(page.items)
         self._video_loading = False
+        self._video_scan = page.state
+        self._video_notices = list(page.notices)
+        for note in page.notices:
+            self._log(note)
         if not self._video_items:
-            # 第一页
             self._video_items = list(videos)
             if not videos:
-                self._video_has_more = False
-                self._show_video_empty("这个对话里没有可下载的视频")
+                self._show_video_empty(
+                    "\n".join(page.notices[:4]) if page.notices else "这个对话里没有可下载的视频"
+                )
             else:
                 self.video_list.set_items(self._video_items)
                 self._show_video_list()
         else:
             existing = {v.message_id for v in self._video_items}
             added = [v for v in videos if v.message_id not in existing]
-            self._video_items.extend(added)
-            if added:
-                self.video_list.append_items(added)
+            if added and self._video_items and any(v.message_id > self._video_items[-1].message_id for v in added):
+                self._video_items.extend(added)
+                self._video_items.sort(key=lambda v: v.message_id, reverse=True)
+                self.video_list.set_items(
+                    self._video_items,
+                    selected=self.video_list.selected_ids,
+                    reset_scroll=False,
+                )
+            else:
+                self._video_items.extend(added)
+                if added:
+                    self.video_list.append_items(added)
             if self._video_items:
                 self._show_video_list()
-        if videos:
-            self._video_offset_id = min(v.message_id for v in videos)
-        self._video_has_more = len(videos) >= 30
+        self._video_has_more = bool(page.has_more)
         self._sync_quality_options()
         self.video_list.refresh_quality(quality_pref_value(self.var_quality.get()))
         self._sync_chat_actions()
@@ -4082,39 +4272,46 @@ class App(tk.Tk):
     ) -> None:
         total = len(messages)
         self._ui_log(f"准备下载 {total} 个视频媒体 → {folder}")
-
-        def _seed() -> None:
-            self.tasks.clear()
-            for msg in messages:
-                key = f"msg-{msg.id}"
-                name = task_display_name(msg, title)
-                self.tasks.upsert(key, name, "queued", total=preferred_media_size(msg, self._quality_pref()) or 0)
-            self._refresh_task_header()
-            self._relayout_tasks()
-
-        self._ui(_seed)
+        self._task_gen += 1
+        gen = self._task_gen
+        rows = []
+        for msg in messages:
+            key = f"{gen}-msg-{msg.id}"
+            name = task_display_name(msg, title)
+            rows.append((key, name, "queued", "", "", preferred_media_size(msg, self._quality_pref()) or 0))
+        self._seed_tasks(rows)
         ok = fail = 0
         for idx, msg in enumerate(messages, 1):
+            key = f"{gen}-msg-{msg.id}"
             if self._stop_flag.is_set():
                 self._ui_log("已停止。")
-                self._ui(lambda: self._mark_remaining_stopped())
+                self._ui(self._mark_remaining_stopped)
                 break
+            if self.queue.cancelled(key):
+                continue
             kind = message_video_kind(msg)
-            key = f"msg-{msg.id}"
             name = task_display_name(msg, title)
             try:
                 path = await self._download_one(
                     entity, msg, folder, title, kind, idx, total, task_key=key, display_name=name
                 )
+                if self.queue.cancelled(key):
+                    continue
                 ok += 1
                 size = path.stat().st_size if path.exists() else (message_file_size(msg) or 0)
-                self._ui(lambda k=key, n=name, s=size: self.tasks.upsert(k, n, "done", current=s, total=s))
+                self._set_task(key, name, "done", current=size, total=size)
                 self._ui_log(f"✓ [{idx}/{total}] {path.name}")
             except Exception as exc:
+                if self.queue.cancelled(key):
+                    continue
+                if is_user_stop(exc):
+                    self._ui_log("已停止。")
+                    self._ui(self._mark_remaining_stopped)
+                    break
                 fail += 1
-                err = explain_error(exc)
-                self._ui(lambda k=key, n=name, e=err: self.tasks.upsert(k, n, "error", error=e))
-                self._ui_log(f"✗ [{idx}/{total}] 消息 {getattr(msg, 'id', '?')}：{err}", error=True)
+                err = link_failure_text("", exc, message_id=getattr(msg, "id", None), title=title)
+                self._set_task(key, name, "error", error=err)
+                self._ui_log(err, error=True)
         self._ui(lambda: self._refresh_task_header(done=True, ok=ok, fail=fail))
         self._ui_log(f"完成：成功 {ok}，失败 {fail}。")
 
@@ -4129,30 +4326,35 @@ class App(tk.Tk):
         total: int,
         task_key: str = "",
         display_name: str = "",
+        source_url: str = "",
     ) -> Path:
         assert self.service
-        label = kind_label(kind)
-        mid = getattr(msg, "id", 0)
         name = display_name or task_display_name(msg, title)
         known = preferred_media_size(msg, self._quality_pref()) or 0
         started = time.monotonic()
         if task_key:
-            self._ui(lambda: self.tasks.upsert(task_key, name, "running", current=0, total=known))
-            self._ui(lambda: self._refresh_task_header())
+            self._set_task(task_key, name, "running", url=source_url, current=0, total=known)
+            self._ui(self._refresh_task_header)
 
         def progress(cur: int, tot: int) -> None:
             elapsed = max(time.monotonic() - started, 0.001)
             speed = cur / elapsed
 
             def _upd() -> None:
-                if task_key:
+                if task_key and not self.queue.cancelled(task_key):
+                    self.queue.upsert(
+                        task_key, name, "running", url=source_url, current=cur, total=tot or known, speed=speed
+                    )
                     self.tasks.upsert(task_key, name, "running", current=cur, total=tot or known, speed=speed)
                     self._refresh_task_header()
 
             self._ui(_upd)
 
+        def _cancelled() -> bool:
+            return self._stop_flag.is_set() or bool(task_key and self.queue.cancelled(task_key))
+
         while True:
-            if self._stop_flag.is_set():
+            if _cancelled():
                 raise UserFacingError("已停止。")
             try:
                 return await self.service.download_message_video(
@@ -4161,33 +4363,39 @@ class App(tk.Tk):
                     folder,
                     progress=progress,
                     chat_title=title,
-                    should_cancel=lambda: self._stop_flag.is_set(),
+                    should_cancel=_cancelled,
                     quality=quality_pref_value(self.var_quality.get()),
                 )
             except FloodWaitError as exc:
                 seconds = int(getattr(exc, "seconds", 0) or 0)
                 self._ui_log(f"请求过于频繁，自动等待 {seconds} 秒后再继续…（可点停止）")
-                await self._sleep_interruptible(seconds)
+                await self._sleep_interruptible(seconds, should_cancel=_cancelled)
 
-    async def _sleep_interruptible(self, seconds: int) -> None:
+    async def _sleep_interruptible(self, seconds: int, should_cancel: Optional[Callable[[], bool]] = None) -> None:
         left = seconds
         while left > 0 and not self._stop_flag.is_set():
+            if should_cancel and should_cancel():
+                return
             step = min(1, left)
             await asyncio.sleep(step)
             left -= step
             self._ui(lambda l=left: self.tasks.set_header("限流等待中…", f"剩余 {l} 秒", show_stop=True))
 
     def _mark_remaining_stopped(self) -> None:
-        for key in list(self.tasks.keys()):
-            item = self.tasks.get(key)
-            if item and item["status"] in ("queued", "running"):
-                self.tasks.upsert(
-                    key,
-                    item["name"],
-                    "stopped",
-                    current=item.get("current") or 0,
-                    total=item.get("total") or 0,
-                )
+        self.queue.mark_stopped()
+        for key in list(self.queue.keys()):
+            item = self.queue.get(key)
+            if item is None or self.queue.cancelled(key):
+                continue
+            self.tasks.upsert(
+                key,
+                item.name,
+                item.status,
+                current=item.current,
+                total=item.total,
+                speed=0.0,
+                error=item.error,
+            )
         self._refresh_task_header(done=True)
 
     def _refresh_task_header(self, done: bool = False, ok: int = 0, fail: int = 0) -> None:

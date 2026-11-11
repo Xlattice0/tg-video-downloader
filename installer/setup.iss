@@ -1,6 +1,6 @@
 #define MyAppName "TG视频下载"
 #define MyAppNameEn "TGVideoDownloader"
-#define MyAppVersion "1.3.15"
+#define MyAppVersion "1.3.16"
 #define MyAppPublisher "Xlattice0"
 #define MyAppUserModelID "Xlattice0.TGVideoDownloader"
 #define MyAppURL "https://github.com/Xlattice0/tg-video-downloader"
