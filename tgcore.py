@@ -68,7 +68,25 @@ from telethon.tl.types import (
 from telethon.utils import stripped_photo_to_jpg
 
 APP_NAME = "TG视频下载"
-APP_VERSION = "1.3.16"
+APP_VERSION = "1.4.0"
+
+# 第一次启动（含从 1.3.x 升级、配置里还没有这项）使用经典浅色侧栏。
+UI_MODE_CLASSIC = "classic"
+UI_MODE_PROFESSIONAL = "professional"
+UI_MODE_CLASSIC_TITLE = "经典"
+UI_MODE_CLASSIC_DESC = "浅色，侧栏链接/对话"
+UI_MODE_PRO_TITLE = "专业"
+UI_MODE_PRO_DESC = "深色，首页任务列表"
+
+TASK_FILTER_ALL = "全部"
+TASK_FILTER_ACTIVE = "下载中"
+TASK_FILTER_DONE = "已完成"
+TASK_FILTERS = (TASK_FILTER_ALL, TASK_FILTER_ACTIVE, TASK_FILTER_DONE)
+
+# 任务行副文案。持久化的中断说明仍是 INTERRUPTED_TASK_HINT，界面上收成这一句。
+STOPPED_ROW_SUBTITLE = "上次未完成"
+FLOOD_ROW_SUBTITLE = "频率限制，可停止"
+DELETE_DIALOG_TITLE = "删除任务"
 APP_DIR_NAME = "TGVideoDownloader"
 APP_USER_MODEL_ID = "Xlattice0.TGVideoDownloader"
 GITHUB_URL = "https://github.com/Xlattice0"
@@ -233,6 +251,47 @@ def update_config(**kwargs: Any) -> dict:
     cfg.update(kwargs)
     save_config(cfg)
     return cfg
+
+
+def normalize_ui_mode(value: Any) -> str:
+    """未知或空值都回到经典，避免老用户一打开就被换成专业界面。"""
+    text = str(value or "").strip().lower()
+    if text in {UI_MODE_PROFESSIONAL, "pro", "专业"}:
+        return UI_MODE_PROFESSIONAL
+    return UI_MODE_CLASSIC
+
+
+def ui_mode_from_config(cfg: Optional[dict] = None) -> str:
+    if not isinstance(cfg, dict):
+        return UI_MODE_CLASSIC
+    return normalize_ui_mode(cfg.get("ui_mode"))
+
+
+def config_with_ui_mode(cfg: Optional[dict], mode: Any) -> dict:
+    """只改界面风格。登录、代理、保存路径和队列文件都不在这里动。"""
+    out = dict(cfg or {})
+    out["ui_mode"] = normalize_ui_mode(mode)
+    return out
+
+
+def appearance_choices() -> list[dict[str, str]]:
+    return [
+        {
+            "mode": UI_MODE_CLASSIC,
+            "title": UI_MODE_CLASSIC_TITLE,
+            "description": UI_MODE_CLASSIC_DESC,
+        },
+        {
+            "mode": UI_MODE_PROFESSIONAL,
+            "title": UI_MODE_PRO_TITLE,
+            "description": UI_MODE_PRO_DESC,
+        },
+    ]
+
+
+def delete_task_message(name: str) -> str:
+    label = (name or "").strip() or "该任务"
+    return f"确定删除「{label}」？"
 
 
 
@@ -1853,6 +1912,177 @@ INTERRUPTED_TASK_HINT = "上次关闭时未下完，已停止。可删除后重�
 # 这些状态会写进 data/download_queue.json。已完成的不回到任务列表，只记入下载记录。
 PERSISTED_TASK_STATUSES = {"queued", "paused", "stopped", "error", "running"}
 
+
+def task_wait_seconds(status: str, wait_seconds: int = 0) -> int:
+    try:
+        seconds = int(wait_seconds or 0)
+    except (TypeError, ValueError):
+        seconds = 0
+    if seconds < 0 or status not in ("running", "queued", "paused"):
+        return 0
+    return seconds
+
+
+def task_matches_filter(status: str, filt: str) -> bool:
+    """已停止和失败只出现在「全部」，不进「已完成」，也不算正在下载。"""
+    chosen = filt if filt in TASK_FILTERS else TASK_FILTER_ALL
+    if chosen == TASK_FILTER_ALL:
+        return True
+    if chosen == TASK_FILTER_DONE:
+        return status == "done"
+    return status in ("running", "queued", "paused")
+
+
+def task_show_stop(status: str, wait_seconds: int = 0) -> bool:
+    if task_wait_seconds(status, wait_seconds):
+        return True
+    return status in ("running", "queued", "paused")
+
+
+def task_show_delete(status: str) -> bool:
+    return status in {"queued", "paused", "stopped", "error", "done", "running"}
+
+
+def task_progress_percent(status: str, current: int = 0, total: int = 0) -> int:
+    if status == "done":
+        return 100
+    try:
+        current_n = int(current or 0)
+        total_n = int(total or 0)
+    except (TypeError, ValueError):
+        return 0
+    if total_n <= 0:
+        return 0
+    return max(0, min(100, int(current_n * 100 / total_n)))
+
+
+def task_size_text(status: str, current: int = 0, total: int = 0) -> str:
+    try:
+        current_n = int(current or 0)
+        total_n = int(total or 0)
+    except (TypeError, ValueError):
+        return ""
+    if status == "done":
+        size = total_n or current_n
+        return format_bytes(size) if size else ""
+    if total_n:
+        return f"{format_bytes(current_n)} / {format_bytes(total_n)}"
+    if current_n:
+        return format_bytes(current_n)
+    return ""
+
+
+def task_speed_text(status: str, speed: float = 0.0, wait_seconds: int = 0) -> str:
+    wait = task_wait_seconds(status, wait_seconds)
+    if wait:
+        return f"等待 {wait} 秒"
+    if status == "stopped":
+        return "已停止"
+    if status == "done":
+        return "已完成"
+    if status == "error":
+        return "失败"
+    if status in ("queued", "paused"):
+        return "排队中"
+    if status == "running":
+        return format_speed(speed) if speed else "下载中"
+    return ""
+
+
+def task_subtitle(status: str, error: str = "", wait_seconds: int = 0) -> str:
+    if task_wait_seconds(status, wait_seconds):
+        return FLOOD_ROW_SUBTITLE
+    if status == "stopped":
+        text = (error or "").strip()
+        if text == INTERRUPTED_TASK_HINT or "未下完" in text:
+            return STOPPED_ROW_SUBTITLE
+        return text
+    if status == "error":
+        return (error or "").strip()
+    return ""
+
+
+def task_bar_tone(status: str, wait_seconds: int = 0) -> str:
+    if task_wait_seconds(status, wait_seconds):
+        return "wait"
+    if status == "done":
+        return "done"
+    if status == "error":
+        return "error"
+    if status == "stopped":
+        return "stopped"
+    return "active"
+
+
+def present_task(
+    name: str,
+    status: str,
+    *,
+    current: int = 0,
+    total: int = 0,
+    speed: float = 0.0,
+    error: str = "",
+    wait_seconds: int = 0,
+) -> dict[str, Any]:
+    """两种界面共用的任务行。已下载标记不在这里，它只看 peer id + message id。"""
+    percent = task_progress_percent(status, current, total)
+    return {
+        "name": name,
+        "status": status,
+        "size_text": task_size_text(status, current, total),
+        "speed_text": task_speed_text(status, speed, wait_seconds),
+        "subtitle": task_subtitle(status, error, wait_seconds),
+        "percent": percent,
+        "percent_text": f"{percent}%",
+        "bar": task_bar_tone(status, wait_seconds),
+        "show_stop": task_show_stop(status, wait_seconds),
+        "show_delete": task_show_delete(status),
+        "wait_seconds": task_wait_seconds(status, wait_seconds),
+    }
+
+
+def summarize_tasks(rows: Iterable[dict]) -> str:
+    """筛选条旁的统计。已停止单独列出，已完成不混进下载中。"""
+    running = waiting = stopped = queued = done = errors = total = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        total += 1
+        status = str(row.get("status") or "")
+        if task_wait_seconds(status, int(row.get("wait_seconds") or 0)):
+            waiting += 1
+        elif status == "running":
+            running += 1
+        elif status == "stopped":
+            stopped += 1
+        elif status in ("queued", "paused"):
+            queued += 1
+        elif status == "done":
+            done += 1
+        elif status == "error":
+            errors += 1
+    if total == 0:
+        return "就绪"
+    parts: list[str] = []
+    if running:
+        parts.append(f"下载中 {running}")
+    if waiting:
+        parts.append(f"等待 {waiting}")
+    if stopped:
+        parts.append(f"已停止 {stopped}")
+    if errors:
+        parts.append(f"失败 {errors}")
+    named = running + waiting + stopped + errors
+    if queued and named:
+        parts.append(f"共 {total}")
+    elif queued:
+        parts.append(f"排队 {queued}")
+    if parts:
+        return " · ".join(parts)
+    if done:
+        return f"已完成 {done}"
+    return "就绪"
+
 _UNSET = object()
 
 
@@ -2198,6 +2428,22 @@ class DownloadQueue:
             if status in ("running", "queued"):
                 return "cancelled"
             return "removed"
+
+    def stop(self, key: str) -> str:
+        """停掉一行，保留在列表里。返回 stopped / ignored / missing。"""
+        with self._lock:
+            item = self._items.get(key)
+            if item is None:
+                return "missing"
+            if item.status not in ("running", "queued", "paused"):
+                return "ignored"
+            self._cancelled.add(key)
+            item.status = "stopped"
+            item.speed = 0.0
+            if not (item.error or "").strip():
+                item.error = ""
+            self._save_locked()
+            return "stopped"
 
     def mark_stopped(self) -> None:
         """全局停止：还没结束的改为已停止，已完成和失败的不动。"""
@@ -2820,15 +3066,24 @@ def clear_session_only() -> None:
 
 
 def clear_credentials(keep_folder: bool = True) -> None:
+    """清除登录会话和 API 凭据。界面风格、代理、保存路径仍留在本机。"""
     cfg = load_config()
-    folder = None
-    if keep_folder:
-        folder = cfg.get("last_save_folder")
-    quality = cfg.get("video_quality")
-    delete_session_files()
     data: dict = {}
-    if folder:
-        data["last_save_folder"] = folder
-    if quality:
-        data["video_quality"] = quality
+    if keep_folder and cfg.get("last_save_folder"):
+        data["last_save_folder"] = cfg.get("last_save_folder")
+    if cfg.get("video_quality"):
+        data["video_quality"] = cfg.get("video_quality")
+    if cfg.get("ui_mode"):
+        data["ui_mode"] = normalize_ui_mode(cfg.get("ui_mode"))
+    for key in (
+        "proxy_type",
+        "proxy_host",
+        "proxy_port",
+        "proxy_user",
+        "proxy_pass",
+        "noticed_personal_use",
+    ):
+        if key in cfg and cfg.get(key) not in (None, ""):
+            data[key] = cfg.get(key)
+    delete_session_files()
     save_config(data)

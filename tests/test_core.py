@@ -30,17 +30,24 @@ from telethon.tl.types import (
 )
 
 from tgcore import (
+    DELETE_DIALOG_TITLE,
     DialogItem,
     DownloadQueue,
     INTERRUPTED_TASK_HINT,
+    UI_MODE_CLASSIC,
+    UI_MODE_PROFESSIONAL,
     UserFacingError,
     VideoItem,
     VideoScanState,
     _normalize_phone,
+    appearance_choices,
     apply_downloaded_marks,
     build_save_name,
     canonical_peer_id,
     classify_video_message,
+    clear_credentials,
+    config_with_ui_mode,
+    delete_task_message,
     dialog_kind,
     dialog_title,
     explain_error,
@@ -52,13 +59,16 @@ from tgcore import (
     is_user_stop,
     link_failure_text,
     list_video_qualities,
+    load_config,
     load_download_records,
     load_unfinished_tasks,
     login_dialog_after_session_loss,
+    normalize_ui_mode,
     parse_telegram_link,
     pick_best_proxy,
     pick_video_quality,
     plan_link_jobs,
+    present_task,
     proxy_from_config,
     quality_pref_label,
     record_download,
@@ -68,7 +78,11 @@ from tgcore import (
     snap_quality_height,
     split_link_text,
     startup_login_target,
+    summarize_tasks,
+    task_matches_filter,
+    ui_mode_from_config,
     unique_path,
+    update_config,
     validate_proxy_settings,
     video_downloaded_label,
     visible_chat_selection,
@@ -704,6 +718,150 @@ class PersistenceTests(unittest.TestCase):
             self.assertFalse(items[0].downloaded)
             # 对话里另存的那条文件还在
             self.assertTrue(items[1].downloaded)
+            for item in items:
+                label = video_downloaded_label(item)
+                self.assertNotIn("peer", label.lower())
+                self.assertNotIn("message", label.lower())
+
+
+class UiModeTests(unittest.TestCase):
+    def test_missing_mode_is_classic_and_switch_keeps_other_settings(self) -> None:
+        self.assertEqual(normalize_ui_mode(None), UI_MODE_CLASSIC)
+        self.assertEqual(normalize_ui_mode(""), UI_MODE_CLASSIC)
+        self.assertEqual(normalize_ui_mode("nope"), UI_MODE_CLASSIC)
+        self.assertEqual(ui_mode_from_config({}), UI_MODE_CLASSIC)
+        self.assertEqual(ui_mode_from_config(None), UI_MODE_CLASSIC)
+        self.assertEqual(ui_mode_from_config({"ui_mode": "professional"}), UI_MODE_PROFESSIONAL)
+
+        original = {
+            "api_id": "100",
+            "api_hash": "hash-value",
+            "proxy_type": "socks5",
+            "proxy_host": "127.0.0.1",
+            "proxy_port": 7891,
+            "last_save_folder": "D:/Videos",
+        }
+        professional = config_with_ui_mode(original, "专业")
+        self.assertEqual(professional["ui_mode"], UI_MODE_PROFESSIONAL)
+        for key, value in original.items():
+            self.assertEqual(professional[key], value)
+        classic = config_with_ui_mode(professional, "classic")
+        self.assertEqual(classic["ui_mode"], UI_MODE_CLASSIC)
+        self.assertEqual(classic["proxy_host"], "127.0.0.1")
+        self.assertEqual(classic["last_save_folder"], "D:/Videos")
+        self.assertEqual(classic["api_hash"], "hash-value")
+        # 队列不在配置里，切换函数也不会去碰它
+        self.assertNotIn("tasks", classic)
+
+        choices = appearance_choices()
+        self.assertEqual([item["mode"] for item in choices], [UI_MODE_CLASSIC, UI_MODE_PROFESSIONAL])
+        self.assertEqual(choices[0]["title"], "经典")
+        self.assertIn("侧栏", choices[0]["description"])
+        self.assertEqual(choices[1]["title"], "专业")
+        self.assertIn("任务列表", choices[1]["description"])
+
+    def test_logout_keeps_ui_mode_proxy_and_save_path(self) -> None:
+        import tgcore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            previous = (tgcore.DATA_DIR, tgcore.CONFIG_PATH, tgcore.SESSION_PATH)
+            tgcore.DATA_DIR = folder
+            tgcore.CONFIG_PATH = folder / "config.json"
+            tgcore.SESSION_PATH = folder / "tg_session"
+            try:
+                update_config(
+                    api_id="100",
+                    api_hash="hash-value",
+                    ui_mode=UI_MODE_PROFESSIONAL,
+                    proxy_type="socks5",
+                    proxy_host="127.0.0.1",
+                    proxy_port=7891,
+                    last_save_folder=str(folder / "saved"),
+                    video_quality="highest",
+                )
+                clear_credentials(keep_folder=True)
+                cfg = load_config()
+            finally:
+                tgcore.DATA_DIR, tgcore.CONFIG_PATH, tgcore.SESSION_PATH = previous
+        self.assertNotIn("api_id", cfg)
+        self.assertNotIn("api_hash", cfg)
+        self.assertEqual(cfg.get("ui_mode"), UI_MODE_PROFESSIONAL)
+        self.assertEqual(cfg.get("proxy_type"), "socks5")
+        self.assertEqual(cfg.get("proxy_host"), "127.0.0.1")
+        self.assertEqual(cfg.get("proxy_port"), 7891)
+        self.assertTrue(str(cfg.get("last_save_folder") or "").endswith("saved"))
+
+
+class TaskPresentationTests(unittest.TestCase):
+    def test_row_copy_for_wait_stopped_done_and_filters(self) -> None:
+        waiting = present_task("采访片段_02.mp4", "running", current=4_200_000, total=28_500_000, wait_seconds=32)
+        self.assertEqual(waiting["speed_text"], "等待 32 秒")
+        self.assertEqual(waiting["subtitle"], "频率限制，可停止")
+        self.assertTrue(waiting["show_stop"])
+        self.assertTrue(waiting["show_delete"])
+        self.assertEqual(waiting["bar"], "wait")
+
+        stopped = present_task(
+            "街访成片.mp4",
+            "stopped",
+            current=36_000_000,
+            total=128_000_000,
+            error=INTERRUPTED_TASK_HINT,
+        )
+        self.assertEqual(stopped["speed_text"], "已停止")
+        self.assertEqual(stopped["subtitle"], "上次未完成")
+        self.assertEqual(stopped["percent"], int(36_000_000 * 100 / 128_000_000))
+        self.assertFalse(stopped["show_stop"])
+        self.assertTrue(stopped["show_delete"])
+        self.assertEqual(stopped["bar"], "stopped")
+        self.assertNotEqual(stopped["speed_text"], "已完成")
+
+        done = present_task("片头.mp4", "done", current=12_000_000, total=12_000_000)
+        self.assertEqual(done["speed_text"], "已完成")
+        self.assertEqual(done["percent"], 100)
+        self.assertFalse(done["show_stop"])
+        self.assertTrue(done["show_delete"])
+
+        self.assertTrue(task_matches_filter("stopped", "全部"))
+        self.assertFalse(task_matches_filter("stopped", "已完成"))
+        self.assertFalse(task_matches_filter("stopped", "下载中"))
+        self.assertTrue(task_matches_filter("done", "已完成"))
+        self.assertFalse(task_matches_filter("done", "下载中"))
+        self.assertTrue(task_matches_filter("running", "下载中"))
+        self.assertTrue(task_matches_filter("queued", "下载中"))
+
+        summary = summarize_tasks(
+            [
+                {"status": "running", "wait_seconds": 0},
+                {"status": "running", "wait_seconds": 32},
+                {"status": "stopped", "wait_seconds": 0},
+                {"status": "done", "wait_seconds": 0},
+            ]
+        )
+        self.assertEqual(summary, "下载中 1 · 等待 1 · 已停止 1")
+        self.assertNotIn("已完成", summary)
+
+        self.assertEqual(DELETE_DIALOG_TITLE, "删除任务")
+        self.assertEqual(delete_task_message("街访成片.mp4"), "确定删除「街访成片.mp4」？")
+
+    def test_stop_one_row_keeps_it_and_does_not_drop_the_queue_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "download_queue.json"
+            queue = DownloadQueue(persist_path=path)
+            queue.upsert("run", "夜间街景.mp4", "running", current=10, total=40)
+            queue.upsert("wait", "采访片段_02.mp4", "queued")
+            self.assertEqual(queue.stop("run"), "stopped")
+            self.assertEqual(queue.get("run").status, "stopped")
+            self.assertEqual(queue.stop("run"), "ignored")
+            self.assertEqual(queue.stop("missing"), "missing")
+            self.assertIn("wait", queue.keys())
+            # 停掉的一行不再接受“还在下载”的进度回写
+            queue.upsert("run", "夜间街景.mp4", "running", current=20, total=40)
+            self.assertEqual(queue.get("run").status, "stopped")
+            reloaded = DownloadQueue(persist_path=path)
+            self.assertEqual(reloaded.get("run").status, "stopped")
+            self.assertEqual(reloaded.get("wait").status, "queued")
 
 
 if __name__ == "__main__":
