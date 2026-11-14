@@ -1434,9 +1434,20 @@ class CaptionButton(tk.Canvas):
         command: Optional[Callable[[], None]] = None,
         bg: str = C_TITLE,
     ) -> None:
-        self._w = ui_px(46)
-        self._h = ui_px(TITLE_H)
-        super().__init__(master, width=self._w, height=self._h, highlightthickness=0, bd=0, bg=bg, cursor="hand2")
+        # Do not store the size on self._w. Tk keeps the widget path there
+        # (".!frame.!frame.!captionbutton"), and create_rectangle then raises
+        # "bad screen distance".
+        self._width = ui_px(46)
+        self._height = ui_px(TITLE_H)
+        super().__init__(
+            master,
+            width=self._width,
+            height=self._height,
+            highlightthickness=0,
+            bd=0,
+            bg=bg,
+            cursor="hand2",
+        )
         self.kind = kind
         self._command = command
         self._bg = bg
@@ -1464,8 +1475,8 @@ class CaptionButton(tk.Canvas):
         else:
             fill, fg = self._bg, C_TEXT
         self.configure(bg=fill)
-        self.create_rectangle(0, 0, self._w, self._h, fill=fill, outline=fill)
-        cx, cy = self._w / 2, self._h / 2
+        self.create_rectangle(0, 0, self._width, self._height, fill=fill, outline=fill)
+        cx, cy = self._width / 2, self._height / 2
         if self.kind == "min":
             self.create_line(cx - 5, cy, cx + 5, cy, fill=fg, width=1)
         elif self.kind == "max":

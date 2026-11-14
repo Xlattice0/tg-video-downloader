@@ -318,6 +318,43 @@ class TaskHintTests(unittest.TestCase):
             root.destroy()
 
 
+class CaptionButtonTests(unittest.TestCase):
+    def test_titlebar_caption_buttons_draw(self) -> None:
+        """Widget path must not be passed to canvas coordinates.
+
+        CaptionButton used to keep its pixel width on self._w. Tk stores the
+        widget path in that attribute, so create_rectangle raised
+        "bad screen distance" while the title bar was built and the app
+        exited before the window appeared.
+        """
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app.Fonts.init(root)
+            bar = tk.Frame(root)
+            bar.pack()
+            buttons = [app.CaptionButton(bar, kind, bg=app.C_TITLE) for kind in ("min", "max", "close")]
+            for btn in buttons:
+                btn.pack(side="right")
+            root.update_idletasks()
+            for btn in buttons:
+                self.assertTrue(str(btn._w).startswith("."), btn._w)
+                self.assertIsInstance(btn._width, int)
+                self.assertIsInstance(btn._height, int)
+                self.assertGreater(btn._width, 0)
+                self.assertGreater(btn._height, 0)
+                items = btn.find_all()
+                self.assertGreaterEqual(len(items), 2)
+                for item in items:
+                    for value in btn.coords(item):
+                        self.assertIsInstance(value, float)
+            buttons[-1]._set_hover(True)
+            buttons[-1]._set_hover(False)
+            self.assertGreaterEqual(len(buttons[-1].find_all()), 2)
+        finally:
+            root.destroy()
+
+
 class AppIconTests(unittest.TestCase):
     def test_packaged_icon_is_a_multisize_teal_folder(self) -> None:
         ico = ROOT / "app-icon.ico"
