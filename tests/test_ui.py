@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import tkinter as tk
+from PIL import Image
 
 from tgcore import APP_VERSION, DownloadQueue, INTERRUPTED_TASK_HINT, VideoItem, VideoQuality
 
@@ -315,6 +316,31 @@ class TaskHintTests(unittest.TestCase):
             self.assertTrue(hit is listing or (hit is not None and _is_under(hit, listing)))
         finally:
             root.destroy()
+
+
+class AppIconTests(unittest.TestCase):
+    def test_packaged_icon_is_a_multisize_teal_folder(self) -> None:
+        ico = ROOT / "app-icon.ico"
+        installer = ROOT / "installer" / "app-icon.ico"
+        self.assertEqual(ico.read_bytes(), installer.read_bytes())
+        with Image.open(ico) as opened:
+            self.assertEqual(
+                set(opened.info["sizes"]),
+                {(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (256, 256)},
+            )
+        with Image.open(ROOT / "app-icon-256.png") as png_file:
+            png = png_file.convert("RGBA")
+        with Image.open(ROOT / "app-icon-64.png") as small:
+            self.assertEqual(small.size, (64, 64))
+        self.assertEqual(png.size, (256, 256))
+        # Rounded square: corners are transparent, the field is cyan, the folder is white.
+        self.assertEqual(png.getpixel((0, 0))[3], 0)
+        field = png.getpixel((128, 30))
+        self.assertLess(field[0], 40)
+        self.assertGreater(field[1], 150)
+        self.assertGreater(field[2], field[0] + 100)
+        self.assertEqual(png.getpixel((80, 60))[:3], (255, 255, 255))
+        self.assertEqual(png.getpixel((200, 200))[:3], (255, 255, 255))
 
 
 def _is_under(widget: tk.Misc, parent: tk.Misc) -> bool:
