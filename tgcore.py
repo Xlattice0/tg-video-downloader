@@ -2021,6 +2021,7 @@ class DownloadQueue:
         self._items: dict[str, QueueTask] = {}
         self._order: list[str] = []
         self._cancelled: set[str] = set()
+        self._halted: set[str] = set()
         self._persist_path = Path(persist_path) if persist_path else None
         if self._persist_path is not None:
             self._load()
@@ -2030,6 +2031,7 @@ class DownloadQueue:
             self._items.clear()
             self._order.clear()
             self._cancelled.clear()
+            self._halted.clear()
             self._save_locked()
 
     def keys(self) -> list[str]:
@@ -2046,6 +2048,21 @@ class DownloadQueue:
     def cancelled(self, key: str) -> bool:
         with self._lock:
             return key in self._cancelled
+
+    def halted(self, key: str) -> bool:
+        """这一行被单独停止，下载循环应跳过它，但不要把它从列表里删掉。"""
+        with self._lock:
+            return key in self._halted
+
+    def halt(self, key: str) -> None:
+        """停止一行。正在下载的会被取消回调打断，排队中的不再开始。"""
+        with self._lock:
+            self._halted.add(key)
+            item = self._items.get(key)
+            if item is not None and item.status in ("queued", "running", "paused", "waiting"):
+                item.status = "stopped"
+                item.speed = 0.0
+            self._save_locked()
 
     def upsert(
         self,
@@ -2189,6 +2206,7 @@ class DownloadQueue:
         with self._lock:
             item = self._items.get(key)
             self._cancelled.add(key)
+            self._halted.discard(key)
             if item is None:
                 self._save_locked()
                 return "missing"

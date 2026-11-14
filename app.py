@@ -70,6 +70,7 @@ from tgcore import (
     pick_video_quality,
     plan_link_jobs,
     proxy_from_config,
+    quality_label,
     quality_pref_label,
     quality_pref_value,
     record_download,
@@ -84,29 +85,142 @@ from tgcore import (
 )
 
 # ------------------------------------------------------------------ palette
-C_BG = "#F3F3F3"
+# Fluent 2 light. rgba(0,0,0,.08) on white is #EBEBEB. One light theme only.
+C_BG = "#F3F4F8"
 C_CARD = "#FFFFFF"
-C_TITLE = "#F9F9F9"
+C_TITLE = "#F9FAFD"
+C_RAIL = "#F3F4F9"
 C_TEXT = "#1A1A1A"
-C_TEXT2 = "#5D5D5D"
+C_TEXT2 = "#5C5C5C"
 C_TEXT3 = "#8A8A8A"
-C_STROKE = "#E5E5E5"
-C_STROKE2 = "#D1D1D1"
-C_ACCENT = "#0F6CBD"
-C_HOVER = "#115EA3"
-C_SEL = "#E6F2FB"
+C_STROKE = "#EBEBEB"
+C_STROKE2 = "#D0D0D0"
+C_ACCENT = "#005FB8"
+C_HOVER = "#0056A5"
+C_PRESS = "#004E93"
+C_SEL = "#EBF3FC"
+C_SEL_2 = "#D6E8F8"
 C_OK = "#0F7B0F"
+C_OK_SOFT = "#E7F4E7"
 C_ERR = "#C42B1C"
-C_BAR = "#EEEEEE"
+C_BAR = "#E6E6E6"
+C_WAIT = "#8A6A1A"
+C_WAIT_BG = "#FBF4E0"
+C_WAIT_BAR = "#C49214"
 C_BADGE = "#F1F1F1"
-C_BADGE_SEL = "#D7E8F6"
+C_BADGE_SEL = "#D6E8F8"
+C_PILL = "#EBF3FC"
+C_FOOT = "#FAFAFB"
+C_FILTER_TRACK = "#ECEEF2"
+C_ICON_MUTED = "#F0F0F0"
 AVATAR_COLORS = ("#5B7C99", "#6B8F71", "#8A6D4A", "#7A6B99", "#6A7A8A")
+
+WINDOW_W = 960
+WINDOW_H = 680
+WINDOW_MIN_W = 760
+WINDOW_MIN_H = 560
+RAIL_W = 68
+TITLE_H = 40
+CTRL_H = 32
+CTRL_RADIUS = 4
+CARD_RADIUS = 8
+NAV_W = 52
+NAV_H = 58
+
+UI_TOKENS = {
+    "window": (WINDOW_W, WINDOW_H),
+    "min_window": (WINDOW_MIN_W, WINDOW_MIN_H),
+    "bg": C_BG,
+    "card": C_CARD,
+    "title": C_TITLE,
+    "rail": C_RAIL,
+    "text": C_TEXT,
+    "text_secondary": C_TEXT2,
+    "text_muted": C_TEXT3,
+    "stroke": C_STROKE,
+    "control_border": C_STROKE2,
+    "accent": C_ACCENT,
+    "accent_hover": C_HOVER,
+    "selected": C_SEL,
+    "success": C_OK,
+    "error": C_ERR,
+    "wait_bg": C_WAIT_BG,
+    "wait_bar": C_WAIT_BAR,
+    "pill": C_PILL,
+    "rail_width": RAIL_W,
+    "control_height": CTRL_H,
+    "control_radius": CTRL_RADIUS,
+    "card_radius": CARD_RADIUS,
+    "about_version": APP_VERSION,
+}
 
 PROXY_LABEL_TO_KIND = {"直连": "none", "SOCKS5": "socks5", "HTTP": "http"}
 PROXY_KIND_TO_LABEL = {v: k for k, v in PROXY_LABEL_TO_KIND.items()}
 PROXY_KIND_TO_LABEL["off"] = "直连"
 PROXY_KIND_TO_LABEL["direct"] = "直连"
 PROXY_KIND_TO_LABEL[""] = "直连"
+
+
+def flood_wait_text(seconds: int) -> str:
+    """限流倒计时，显示在任务行上，例如「等待 32 秒」。"""
+    return f"等待 {max(0, int(seconds))} 秒"
+
+
+def stopped_display(error: str = "") -> str:
+    """恢复或中断的任务显示「已停止」，未完成的补上「上次未完成」。"""
+    text = (error or "").strip()
+    if "未下完" in text or "未完成" in text:
+        return "已停止 上次未完成"
+    if not text:
+        return "已停止"
+    if text.startswith("已停止"):
+        return text
+    return f"已停止 {text}"
+
+
+def task_row_status_text(
+    status: str,
+    error: str = "",
+    speed: float = 0.0,
+    total: int = 0,
+    current: int = 0,
+) -> str:
+    if status == "done":
+        return format_bytes(total or current) if (total or current) else ""
+    if status == "waiting":
+        return error or flood_wait_text(0)
+    if status == "stopped":
+        return stopped_display(error)
+    if status == "queued":
+        return "排队中"
+    if status == "error":
+        return error or "失败"
+    if speed:
+        return format_speed(speed)
+    return "下载中"
+
+
+def video_row_subtitle(item: VideoItem, pref: Optional[str] = None) -> str:
+    """清晰度已知时写成「1080p · 42.6 MB · 今天 16:08」，未知则只有体积和日期。"""
+    chosen = pick_video_quality(item.qualities or [], pref)
+    size = chosen.size if chosen and chosen.size else item.size
+    parts: list[str] = []
+    label = ""
+    if chosen is not None and chosen.label and chosen.label not in ("原画", "最高"):
+        label = chosen.label
+    elif item.width and item.height:
+        guessed = quality_label(item.width, item.height)
+        if guessed and guessed not in ("原画", "最高"):
+            label = guessed
+    if label:
+        parts.append(label)
+    parts.append(format_bytes(size))
+    parts.append(format_date_short(item.date))
+    if item.note:
+        parts.append(item.note)
+    elif not item.downloadable:
+        parts.append("无法下载")
+    return " · ".join(p for p in parts if p)
 
 
 def resource_path(*names: str) -> Optional[Path]:
@@ -385,7 +499,7 @@ def _tray_image():
 
     path = resource_path("app-icon.ico", "app-icon-64.png", "app-icon-256.png")
     if path is None:
-        return _Image.new("RGBA", (32, 32), (15, 108, 189, 255))
+        return _Image.new("RGBA", (32, 32), (0, 95, 184, 255))
     img = _Image.open(path)
     best = None
     try:
@@ -554,6 +668,8 @@ class Fonts:
             "Noto Sans SC",
             "PingFang SC",
             "Segoe UI",
+            "WenQuanYi Micro Hei",
+            "Droid Sans Fallback",
         )
         available = set(tkfont.families(root))
         cls.family = next((n for n in preferred if n in available), "TkDefaultFont")
@@ -753,8 +869,8 @@ class FlatButton(tk.Canvas):
         command: Optional[Callable[[], None]] = None,
         variant: str = "secondary",
         width: Optional[int] = None,
-        height: int = 32,
-        radius: int = 6,
+        height: int = CTRL_H,
+        radius: int = CTRL_RADIUS,
         font: Any = None,
         padx: int = 14,
         bg: Optional[str] = None,
@@ -796,7 +912,7 @@ class FlatButton(tk.Canvas):
 
     def set_text(self, text: str) -> None:
         self._text = text
-        measure_font = Fonts.body_bold if self._variant == "primary" and Fonts.body_bold else self._font
+        measure_font = Fonts.body_bold if self._variant in ("primary", "danger") and Fonts.body_bold else self._font
         tw = measure_font.measure(text) if hasattr(measure_font, "measure") else len(text) * 8
         self._width = self._min_width or max(tw + self._padx * 2, 64)
         self.configure(width=self._width)
@@ -814,13 +930,23 @@ class FlatButton(tk.Canvas):
         if self._state == "normal" and self._command:
             self._command()
 
+    def set_bg(self, bg: str) -> None:
+        self._parent_bg = bg
+        self.configure(bg=bg)
+        self._redraw()
+
     def _colors(self) -> tuple[str, str, str]:
         if self._state != "normal":
             if self._variant == "primary":
                 return "#8BB8DE", "#FFFFFF", "#8BB8DE"
+            if self._variant == "danger":
+                return "#E7B2AC", "#FFFFFF", "#E7B2AC"
             return C_CARD, "#B0B0B0", C_STROKE2
         if self._variant == "primary":
             fill = C_HOVER if self._hover else C_ACCENT
+            return fill, "#FFFFFF", fill
+        if self._variant == "danger":
+            fill = "#A82418" if self._hover else C_ERR
             return fill, "#FFFFFF", fill
         fill = "#F5F5F5" if self._hover else C_CARD
         return fill, C_TEXT, C_STROKE2
@@ -828,7 +954,7 @@ class FlatButton(tk.Canvas):
     def _redraw(self) -> None:
         self.delete("all")
         fill, fg, outline = self._colors()
-        font = Fonts.body_bold if self._variant == "primary" else self._font
+        font = Fonts.body_bold if self._variant in ("primary", "danger") and Fonts.body_bold else self._font
         rounded_rect(
             self,
             0.5,
@@ -1022,10 +1148,10 @@ class NavButton(tk.Canvas):
         kind: str,
         label: str,
         command: Optional[Callable[[], None]] = None,
-        width: int = 48,
-        height: int = 56,
+        width: int = NAV_W,
+        height: int = NAV_H,
     ) -> None:
-        super().__init__(master, width=width, height=height, highlightthickness=0, bd=0, bg=C_BG, cursor="hand2")
+        super().__init__(master, width=width, height=height, highlightthickness=0, bd=0, bg=C_RAIL, cursor="hand2")
         self.kind = kind
         self.label = label
         self._command = command
@@ -1079,20 +1205,20 @@ class NavButton(tk.Canvas):
 
     def redraw(self) -> None:
         self.delete("all")
+        self.configure(bg=C_RAIL)
         color = C_ACCENT if self.active else C_TEXT2
         font = Fonts.nav_active if self.active else Fonts.nav
         if self.active:
-            rounded_rect(self, 0, 0, self._width, self._height, 6, fill=C_SEL, outline=C_SEL)
+            rounded_rect(self, 0, 0, self._width, self._height, 8, fill=C_SEL, outline=C_SEL)
+            self.create_rectangle(0, 14, 3, self._height - 14, fill=C_ACCENT, outline=C_ACCENT)
         elif self._hover:
-            rounded_rect(self, 0, 0, self._width, self._height, 6, fill="#EAEAEA", outline="#EAEAEA")
-        else:
-            self.configure(bg=C_BG)
+            rounded_rect(self, 0, 0, self._width, self._height, 8, fill="#E8E9EE", outline="#E8E9EE")
         icon_size = 20
-        icon_x, icon_y = (self._width - icon_size) // 2, 7
+        icon_x, icon_y = (self._width - icon_size) // 2, 8
         kind = self.kind if self.kind in ("link", "chat", "proxy", "about", "user", "settings") else "settings"
         self._icon_photo = make_nav_icon(kind, color, icon_size, self)
         self.create_image(icon_x, icon_y, anchor="nw", image=self._icon_photo)
-        self.create_text(self._width / 2, 42, text=self.label, fill=color, font=font)
+        self.create_text(self._width / 2, 44, text=self.label, fill=color, font=font)
         if self._badge > 0:
             label = "99+" if self._badge > 99 else str(self._badge)
             scale = 1.0 + 0.28 * self._pulse
@@ -1103,22 +1229,16 @@ class NavButton(tk.Canvas):
             self.create_text(cx, cy, text=label, fill="#FFFFFF", font=badge_font)
 
 
-class AccountButton(tk.Canvas):
-    """左侧边栏底部的账号入口：未登录显示「登录」，已登录只显示头像和绿点，不显示名称。"""
+class TitleAccount(tk.Canvas):
+    """标题栏右侧账号：未登录是「登录」，已登录是绿点 +「已登录 · 名称 ▾」。"""
 
-    def __init__(
-        self,
-        master: tk.Misc,
-        command: Optional[Callable[[], None]] = None,
-        width: int = 48,
-        height: int = 56,
-    ) -> None:
-        super().__init__(master, width=width, height=height, highlightthickness=0, bd=0, bg=C_BG, cursor="hand2")
+    def __init__(self, master: tk.Misc, command: Optional[Callable[[], None]] = None, bg: str = C_TITLE) -> None:
+        super().__init__(master, width=72, height=28, highlightthickness=0, bd=0, bg=bg, cursor="hand2")
         self._command = command
+        self._bg = bg
         self._hover = False
-        self._width = width
-        self._height = height
         self._logged_in = False
+        self._name = ""
         self.bind("<Button-1>", lambda _e: self._command() if self._command else None)
         self.bind("<Enter>", lambda _e: self._set_hover(True))
         self.bind("<Leave>", lambda _e: self._set_hover(False))
@@ -1130,32 +1250,177 @@ class AccountButton(tk.Canvas):
 
     def set_state(self, logged_in: bool, name: str = "") -> None:
         self._logged_in = bool(logged_in)
+        self._name = name or ""
         self.redraw()
 
     def redraw(self) -> None:
         self.delete("all")
+        font = Fonts.help or Fonts.body
         if self._logged_in:
+            text = f"已登录 · {self._name} ▾" if self._name else "已登录 ▾"
             color = C_TEXT if self._hover else C_TEXT2
         else:
+            text = "登录"
             color = C_HOVER if self._hover else C_ACCENT
+            font = Fonts.body_bold or font
+        tw = font.measure(text) if hasattr(font, "measure") else len(text) * 8
+        width = max(72, tw + (28 if self._logged_in else 20))
+        self.configure(width=width, height=28, bg=self._bg)
         if self._hover:
-            rounded_rect(self, 0, 0, self._width, self._height, 6, fill="#EAEAEA", outline="#EAEAEA")
-        else:
-            self.configure(bg=C_BG)
-        icon_size = 20
+            rounded_rect(self, 0, 0, width, 28, 4, fill="#E8E9EE", outline="#E8E9EE")
+        x = 10
         if self._logged_in:
-            icon_x = (self._width - icon_size) // 2
-            icon_y = (self._height - icon_size) // 2
+            self.create_oval(x, 10, x + 7, 17, fill=C_OK, outline=C_OK_SOFT, width=2)
+            x += 14
+        self.create_text(x, 14, text=text, fill=color, font=font, anchor="w")
+
+
+class CaptionButton(tk.Canvas):
+    """标题栏最小化 / 最大化 / 关闭。关闭悬停用错误色。"""
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        kind: str,
+        command: Optional[Callable[[], None]] = None,
+        bg: str = C_TITLE,
+    ) -> None:
+        super().__init__(master, width=46, height=TITLE_H, highlightthickness=0, bd=0, bg=bg, cursor="hand2")
+        self.kind = kind
+        self._command = command
+        self._bg = bg
+        self._hover = False
+        self.bind("<Enter>", lambda _e: self._set_hover(True))
+        self.bind("<Leave>", lambda _e: self._set_hover(False))
+        self.bind("<Button-1>", self._click)
+        self._draw()
+
+    def _set_hover(self, value: bool) -> None:
+        self._hover = value
+        self._draw()
+
+    def _click(self, _event: tk.Event | None = None) -> str | None:
+        if self._command:
+            self._command()
+        return "break"
+
+    def _draw(self) -> None:
+        self.delete("all")
+        if self.kind == "close" and self._hover:
+            fill, fg = C_ERR, "#FFFFFF"
+        elif self._hover:
+            fill, fg = "#E5E5E5", C_TEXT
         else:
-            icon_x, icon_y = (self._width - icon_size) // 2, 7
-        self._icon_photo = make_nav_icon("user", color, icon_size, self)
-        self.create_image(icon_x, icon_y, anchor="nw", image=self._icon_photo)
-        if self._logged_in:
-            r = 3.2
-            cx, cy = icon_x + icon_size - 1, icon_y + 2
-            self.create_oval(cx - r, cy - r, cx + r, cy + r, fill=C_OK, outline="#FFFFFF", width=1.2)
+            fill, fg = self._bg, C_TEXT
+        self.configure(bg=fill)
+        self.create_rectangle(0, 0, 46, TITLE_H, fill=fill, outline=fill)
+        cx, cy = 23, TITLE_H / 2
+        if self.kind == "min":
+            self.create_line(cx - 5, cy, cx + 5, cy, fill=fg, width=1)
+        elif self.kind == "max":
+            self.create_rectangle(cx - 5, cy - 4, cx + 5, cy + 4, outline=fg, width=1)
         else:
-            self.create_text(self._width / 2, 42, text="登录", fill=color, font=Fonts.nav_active)
+            self.create_line(cx - 5, cy - 5, cx + 5, cy + 5, fill=fg, width=1)
+            self.create_line(cx + 5, cy - 5, cx - 5, cy + 5, fill=fg, width=1)
+
+
+class MenuFlyout(tk.Toplevel):
+    """白底账号 / 设置菜单。危险项用错误色。单独置顶，避免被主窗口盖住。"""
+
+    def __init__(self, master: tk.Misc, items: list[tuple[str, Optional[Callable[[], None]], bool] | str]) -> None:
+        super().__init__(master)
+        self.withdraw()
+        self.overrideredirect(True)
+        self.configure(bg=C_CARD, highlightthickness=1, highlightbackground=C_STROKE)
+        try:
+            self.transient(master)
+        except Exception:
+            pass
+        self._built = False
+        self._rows: list[tk.Label] = []
+        inner = tk.Frame(self, bg=C_CARD)
+        inner.pack(fill="both", expand=True, padx=6, pady=6)
+        for spec in items:
+            if spec == "-":
+                tk.Frame(inner, bg=C_STROKE, height=1).pack(fill="x", padx=8, pady=4)
+                continue
+            label, command, danger = spec  # type: ignore[misc]
+            fg = C_ERR if danger else C_TEXT
+            row = tk.Label(
+                inner,
+                text=label,
+                bg=C_CARD,
+                fg=fg,
+                font=Fonts.body,
+                anchor="w",
+                padx=10,
+                pady=6,
+                cursor="hand2",
+            )
+            row.pack(fill="x")
+            row.bind("<Enter>", lambda _e, r=row: r.configure(bg=C_SEL))
+            row.bind("<Leave>", lambda _e, r=row, c=fg: r.configure(bg=C_CARD, fg=c))
+            row.bind("<Button-1>", lambda _e, fn=command: self._run(fn))
+            self._rows.append(row)
+        self._built = True
+
+    def hide(self) -> None:
+        try:
+            if self.winfo_ismapped():
+                self.withdraw()
+        except tk.TclError:
+            pass
+
+    def popup(self, anchor: tk.Widget, *, above: bool = False) -> None:
+        self.update_idletasks()
+        ax = anchor.winfo_rootx()
+        ay = anchor.winfo_rooty()
+        width = max(176, self.winfo_reqwidth())
+        height = max(32, self.winfo_reqheight())
+        owner = self.master
+        try:
+            left = int(owner.winfo_rootx()) + 8
+            right_limit = int(owner.winfo_rootx()) + int(owner.winfo_width()) - width - 8
+        except tk.TclError:
+            left, right_limit = 8, ax
+        x = min(max(left, ax + anchor.winfo_width() - width), max(left, right_limit))
+        if above:
+            y = max(8, ay - height - 4)
+        else:
+            y = ay + anchor.winfo_height() + 4
+        self.geometry(f"{width}x{height}+{int(x)}+{int(y)}")
+        self.deiconify()
+        self.lift()
+
+    def _run(self, command: Optional[Callable[[], None]]) -> None:
+        self.hide()
+        if command:
+            command()
+
+
+class SpeedPill(tk.Canvas):
+    """任务顶栏的速度胶囊，浅蓝底 + 强调色字。"""
+
+    def __init__(self, master: tk.Misc) -> None:
+        super().__init__(master, width=10, height=22, highlightthickness=0, bd=0, bg=C_CARD)
+        self._text = ""
+
+    def set_text(self, text: str) -> None:
+        self._text = (text or "").strip()
+        self.delete("all")
+        if not self._text:
+            self.configure(width=1, height=22)
+            if self.winfo_ismapped():
+                self.pack_forget()
+            return
+        font = Fonts.help or Fonts.body
+        tw = font.measure(self._text) if hasattr(font, "measure") else len(self._text) * 8
+        width = tw + 16
+        self.configure(width=width, height=22, bg=C_CARD)
+        rounded_rect(self, 0, 0, width, 22, 4, fill=C_PILL, outline=C_PILL)
+        self.create_text(width / 2, 11, text=self._text, fill=C_ACCENT, font=font)
+        if not self.winfo_ismapped():
+            self.pack(side="left", padx=(0, 8))
 
 
 SB_W = 12
@@ -1611,7 +1876,7 @@ class ChatList(tk.Frame):
 
 THUMB_W = 128
 THUMB_H = 72
-THUMB_RADIUS = 4
+THUMB_RADIUS = 6
 VIDEO_ROW_H = 88
 CHK_SIZE = 16
 CHK_RADIUS = 3
@@ -1865,14 +2130,7 @@ class VideoRow(tk.Frame):
         self.lbl_title.configure(text=elide_text(Fonts.body, self._title_full, width))
 
     def _meta_text(self, pref: Optional[str] = None) -> str:
-        chosen = pick_video_quality(self.item.qualities or [], pref or self._quality_pref)
-        size = chosen.size if chosen else self.item.size
-        parts = [format_bytes(size), format_date_short(self.item.date)]
-        if self.item.note:
-            parts.append(self.item.note)
-        elif not self.item.downloadable:
-            parts.append("无法下载")
-        return " · ".join(p for p in parts if p)
+        return video_row_subtitle(self.item, pref or self._quality_pref)
 
     def refresh_meta(self, pref: Optional[str] = None) -> None:
         if pref is not None:
@@ -2031,36 +2289,96 @@ class VideoList(tk.Frame):
             row.refresh_meta()
 
 
+_TASK_ICON_CACHE: dict[tuple[str, int], ImageTk.PhotoImage] = {}
+
+
+def make_task_icon(kind: str, widget: Optional[tk.Misc] = None) -> ImageTk.PhotoImage:
+    """任务行左侧的小文件标：下载中蓝、完成绿、等待琥珀、停止灰、失败红。"""
+    px = scaled_px(28, widget)
+    key = (kind, px)
+    cached = _TASK_ICON_CACHE.get(key)
+    if cached is not None:
+        return cached
+    palette = {
+        "running": ("#E8F2FC", C_ACCENT),
+        "queued": (C_ICON_MUTED, C_TEXT3),
+        "waiting": ("#F4E4B8", C_WAIT_BAR),
+        "stopped": (C_ICON_MUTED, C_TEXT3),
+        "done": (C_OK_SOFT, C_OK),
+        "error": ("#F8E6E4", C_ERR),
+    }
+    bg_hex, fg_hex = palette.get(kind, palette["queued"])
+    over = 3
+    s = px * over
+    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle((0, 0, s - 1, s - 1), radius=s // 5, fill=_hex_rgb(bg_hex) + (255,))
+    fg = _hex_rgb(fg_hex) + (255,)
+    # small film frame + play triangle
+    draw.rounded_rectangle((s * 0.22, s * 0.28, s * 0.78, s * 0.72), radius=s * 0.08, outline=fg, width=max(2, s // 18))
+    draw.polygon(
+        [(s * 0.42, s * 0.40), (s * 0.42, s * 0.60), (s * 0.62, s * 0.50)],
+        fill=fg,
+    )
+    img = img.resize((px, px), Image.Resampling.LANCZOS)
+    photo = ImageTk.PhotoImage(img)
+    _TASK_ICON_CACHE[key] = photo
+    return photo
+
+
 class TaskRow(tk.Frame):
-    def __init__(self, master: tk.Misc, on_remove: Optional[Callable[[str], None]] = None) -> None:
+    def __init__(
+        self,
+        master: tk.Misc,
+        on_remove: Optional[Callable[[str], None]] = None,
+        on_stop_one: Optional[Callable[[str], None]] = None,
+    ) -> None:
         super().__init__(master, bg=C_CARD)
         self.key = ""
         self._on_remove = on_remove
-        top = tk.Frame(self, bg=C_CARD)
-        top.pack(fill="x", padx=12, pady=(10, 0))
+        self._on_stop_one = on_stop_one
+        self._bg = C_CARD
+        self._status = ""
+        self._bar_pct = 0
+        self._bar_color = C_ACCENT
+
+        rule = tk.Frame(self, bg=C_STROKE, height=1)
+        rule.pack_propagate(False)
+        rule.pack(side="bottom", fill="x")
+
+        actions = tk.Frame(self, bg=C_CARD)
+        actions.pack(side="right", padx=(8, 12))
+        self._actions = actions
+        self.btn_stop = FlatButton(actions, "停止", command=self._stop_clicked, height=26, padx=10, font=Fonts.help, bg=C_CARD)
+        self.btn_remove = FlatButton(actions, "删除", command=self._remove_clicked, height=26, padx=10, font=Fonts.help, bg=C_CARD)
+        self.btn_remove.pack(side="right")
+
+        self.icon = tk.Label(self, bg=C_CARD)
+        self.icon.pack(side="left", padx=(12, 8), pady=10)
+
+        body = tk.Frame(self, bg=C_CARD)
+        body.pack(side="left", fill="both", expand=True, pady=(8, 8))
+        self._body = body
+
+        top = tk.Frame(body, bg=C_CARD)
+        top.pack(fill="x")
+        self._top = top
         self.lbl_name = tk.Label(top, text="", bg=C_CARD, fg=C_TEXT, font=Fonts.body, anchor="w")
         self.lbl_name.pack(side="left", fill="x", expand=True)
-        self.btn_remove = tk.Label(top, text="删除", bg=C_CARD, fg=C_ACCENT, font=Fonts.aux, cursor="hand2")
-        self.btn_remove.pack(side="right")
-        self.btn_remove.bind("<Button-1>", self._remove_clicked)
         self.lbl_stat = tk.Label(top, text="", bg=C_CARD, fg=C_TEXT2, font=Fonts.aux, anchor="e")
-        self.lbl_stat.pack(side="right", padx=(0, 10))
+        self.lbl_stat.pack(side="right")
 
-        mid = tk.Frame(self, bg=C_CARD)
-        mid.pack(fill="x", padx=12, pady=(2, 0))
-        self.lbl_sub = tk.Label(
-            mid, text="", bg=C_CARD, fg=C_TEXT3, font=Fonts.aux, anchor="w", justify="left", wraplength=420
-        )
+        mid = tk.Frame(body, bg=C_CARD)
+        mid.pack(fill="x", pady=(1, 0))
+        self._mid = mid
+        self.lbl_sub = tk.Label(mid, text="", bg=C_CARD, fg=C_TEXT3, font=Fonts.aux, anchor="w")
         self.lbl_sub.pack(side="left", fill="x", expand=True)
         self.lbl_pct = tk.Label(mid, text="", bg=C_CARD, fg=C_TEXT2, font=Fonts.aux, anchor="e")
         self.lbl_pct.pack(side="right")
 
-        self.bar = tk.Canvas(self, height=4, highlightthickness=0, bd=0, bg=C_CARD)
-        self.bar.pack(fill="x", padx=12, pady=(6, 11))
-        self._bar_pct = 0
-        self._bar_color = C_ACCENT
+        self.bar = tk.Canvas(body, height=6, highlightthickness=0, bd=0, bg=C_CARD)
+        self.bar.pack(fill="x", pady=(6, 0))
         self.bar.bind("<Configure>", lambda _e: self._draw_bar(self._bar_pct, self._bar_color))
-        tk.Frame(self, bg=C_STROKE, height=1).pack(fill="x")
 
     def update_row(
         self,
@@ -2071,59 +2389,98 @@ class TaskRow(tk.Frame):
         speed: float = 0.0,
         error: str = "",
     ) -> None:
-        self.lbl_name.configure(text=name, fg=C_TEXT2 if status == "done" else C_TEXT)
+        self._status = status
+        pct = int(current * 100 / total) if total else (100 if status == "done" else 0)
+        pct = max(0, min(100, pct))
+        sub = task_row_status_text(status, error, speed, total, current)
+        sub_fg = C_TEXT3
+        stat_fg = C_TEXT2
+        pct_fg = C_TEXT2
+        name_fg = C_TEXT
+        bar_color = C_ACCENT
+        row_bg = C_CARD
+        icon_kind = status if status in ("running", "queued", "waiting", "stopped", "done", "error") else "queued"
         if status == "done":
-            self.lbl_stat.configure(text="已完成", fg=C_OK)
-            self.lbl_sub.configure(text=format_bytes(total or current) if (total or current) else "", fg=C_TEXT3)
-            self.lbl_pct.configure(text="100%", fg=C_TEXT2)
-            pct = 100
+            stat = "已完成"
+            stat_fg = pct_fg = sub_fg = C_OK
             bar_color = C_OK
+            pct = 100
         elif status == "error":
-            self.lbl_stat.configure(text="失败", fg=C_ERR)
-            self.lbl_sub.configure(text=error or "", fg=C_ERR)
-            self.lbl_pct.configure(text="")
-            pct = int(current * 100 / total) if total else 0
+            stat = "失败"
+            stat_fg = sub_fg = C_ERR
             bar_color = C_ERR
-        elif status == "stopped":
-            self.lbl_stat.configure(text="已停止", fg=C_TEXT2)
-            self.lbl_sub.configure(text=error or "", fg=C_TEXT3)
             self.lbl_pct.configure(text="")
-            pct = int(current * 100 / total) if total else 0
-            bar_color = C_TEXT3
+        elif status == "stopped":
+            stat = f"{format_bytes(current)} / {format_bytes(total)}" if total else (format_bytes(current) if current else "")
+            bar_color = "#B0B0B0"
+            sub_fg = C_TEXT2
+        elif status == "waiting":
+            stat = f"{format_bytes(current)} / {format_bytes(total)}" if total else ""
+            sub_fg = C_WAIT
+            bar_color = C_WAIT_BAR
+            row_bg = C_WAIT_BG
         elif status == "queued":
-            size = f"{format_bytes(total)}" if total else ""
-            self.lbl_stat.configure(text=size, fg=C_TEXT2)
-            self.lbl_sub.configure(text="排队中", fg=C_TEXT3)
-            self.lbl_pct.configure(text="0%" if not current else f"{int(current * 100 / total) if total else 0}%")
-            pct = int(current * 100 / total) if total else 0
+            stat = format_bytes(total) if total else ""
             bar_color = C_ACCENT
         else:
+            icon_kind = "running"
             if total:
-                self.lbl_stat.configure(text=f"{format_bytes(current)} / {format_bytes(total)}", fg=C_TEXT2)
-                pct = int(current * 100 / total) if total else 0
+                stat = f"{format_bytes(current)} / {format_bytes(total)}"
             else:
-                self.lbl_stat.configure(text=format_bytes(current) if current else "", fg=C_TEXT2)
-                pct = 0
-            self.lbl_sub.configure(text=format_speed(speed) if speed else "下载中", fg=C_TEXT3)
-            self.lbl_pct.configure(text=f"{pct}%")
+                stat = format_bytes(current) if current else ""
             bar_color = C_ACCENT
+        if status == "error":
+            stat_text = stat
+            pct_text = ""
+        else:
+            stat_text = stat
+            pct_text = f"{pct}%"
+        self._apply_bg(row_bg)
+        self.lbl_name.configure(text=name, fg=name_fg)
+        self.lbl_stat.configure(text=stat_text, fg=stat_fg)
+        self.lbl_sub.configure(text=sub, fg=sub_fg)
+        self.lbl_pct.configure(text=pct_text, fg=pct_fg)
+        self.icon.configure(image=make_task_icon(icon_kind, self))
+        self._icon_ref = make_task_icon(icon_kind, self)
+        self.icon.configure(image=self._icon_ref)
+        show_stop = status in ("running", "waiting")
+        if show_stop:
+            if not self.btn_stop.winfo_ismapped():
+                self.btn_stop.pack(side="right", padx=(0, 6))
+        elif self.btn_stop.winfo_ismapped():
+            self.btn_stop.pack_forget()
         self._draw_bar(pct, bar_color)
+
+    def _apply_bg(self, bg: str) -> None:
+        self._bg = bg
+        self.configure(bg=bg)
+        for widget in (self.icon, self._body, self._top, self._mid, self.lbl_name, self.lbl_stat, self.lbl_sub, self.lbl_pct, self.bar, self._actions):
+            try:
+                widget.configure(bg=bg)
+            except tk.TclError:
+                pass
+        self.btn_stop.set_bg(bg)
+        self.btn_remove.set_bg(bg)
 
     def _draw_bar(self, pct: int, color: str) -> None:
         self._bar_pct = pct
         self._bar_color = color
         self.bar.delete("all")
         w = max(int(self.bar.winfo_width()), 1)
-        h = 4
-        self.bar.create_rectangle(0, 0, w, h, fill=C_BAR, outline=C_BAR)
+        h = 6
+        track = "#E4D7B0" if self._status == "waiting" else C_BAR
+        rounded_rect(self.bar, 0, 0, w, h, 3, fill=track, outline=track)
         fw = max(0, int(w * max(0, min(pct, 100)) / 100))
         if fw:
-            self.bar.create_rectangle(0, 0, fw, h, fill=color, outline=color)
+            rounded_rect(self.bar, 0, 0, max(fw, 6), h, 3, fill=color, outline=color)
 
-    def _remove_clicked(self, _event: tk.Event | None = None) -> str | None:
+    def _remove_clicked(self) -> None:
         if self._on_remove and self.key:
             self._on_remove(self.key)
-        return "break"
+
+    def _stop_clicked(self) -> None:
+        if self._on_stop_one and self.key:
+            self._on_stop_one(self.key)
 
 
 class TaskList(tk.Frame):
@@ -2134,6 +2491,7 @@ class TaskList(tk.Frame):
         on_open_folder: Optional[Callable[[], None]] = None,
         on_close: Optional[Callable[[], None]] = None,
         on_remove: Optional[Callable[[str], None]] = None,
+        on_stop_one: Optional[Callable[[str], None]] = None,
     ) -> None:
         super().__init__(
             master,
@@ -2146,6 +2504,7 @@ class TaskList(tk.Frame):
         self._on_open_folder = on_open_folder
         self._on_close = on_close
         self._on_remove = on_remove
+        self._on_stop_one = on_stop_one
         self._items: dict[str, dict[str, Any]] = {}
         self._order: list[str] = []
         self._rows: dict[str, TaskRow] = {}
@@ -2169,10 +2528,10 @@ class TaskList(tk.Frame):
         self._header = hd
         hd.pack(fill="x")
         hd.pack_propagate(False)
-        self.lbl_title = tk.Label(hd, text="就绪", bg=C_CARD, fg=C_TEXT, font=Fonts.help, anchor="w")
-        self.lbl_title.pack(side="left", padx=12)
+        self.lbl_title = tk.Label(hd, text="就绪", bg=C_CARD, fg=C_TEXT, font=Fonts.body_bold, anchor="w")
+        self.lbl_title.pack(side="left", padx=(12, 8))
+        self.speed_pill = SpeedPill(hd)
         self.lbl_meta = tk.Label(hd, text="", bg=C_CARD, fg=C_TEXT2, font=Fonts.help, anchor="w")
-        self.lbl_meta.pack(side="left", padx=(2, 0))
         self.btn_close = FlatButton(hd, "关闭", command=self._close, height=26, padx=10, font=Fonts.help, bg=C_CARD)
         self.btn_stop = FlatButton(hd, "停止", command=on_stop, height=26, padx=10, font=Fonts.help, bg=C_CARD)
         self.btn_open_folder = FlatButton(
@@ -2198,9 +2557,20 @@ class TaskList(tk.Frame):
         self._show_stop(False)
         self._show_open(False)
 
-    def set_header(self, title: str, meta: str = "", show_stop: bool = False, show_open: bool = False) -> None:
+    def set_header(
+        self,
+        title: str,
+        meta: str = "",
+        show_stop: bool = False,
+        show_open: bool = False,
+        speed: str = "",
+    ) -> None:
         self.lbl_title.configure(text=title)
-        self.lbl_meta.configure(text=meta)
+        self.lbl_meta.configure(text="")
+        shown = (speed or "").strip()
+        if not shown and meta and ("/s" in meta):
+            shown = meta.replace("·", "").strip()
+        self.speed_pill.set_text(shown)
         self._show_stop(show_stop)
         self._show_open(show_open)
 
@@ -2298,7 +2668,7 @@ class TaskList(tk.Frame):
         self._show_empty(False)
         row = self._rows.get(key)
         if row is None:
-            row = TaskRow(self.scroll.inner, on_remove=self._on_remove)
+            row = TaskRow(self.scroll.inner, on_remove=self._on_remove, on_stop_one=self._on_stop_one)
             row.key = key
             self._rows[key] = row
             self._repack()
@@ -2333,6 +2703,13 @@ class TaskList(tk.Frame):
         total = len(self._order)
         return done, running, total
 
+    def summary(self) -> dict[str, int]:
+        counts = {"running": 0, "waiting": 0, "stopped": 0, "queued": 0, "done": 0, "error": 0}
+        for item in self._items.values():
+            status = str(item.get("status") or "")
+            counts[status] = counts.get(status, 0) + 1
+        return counts
+
     def current_speed(self) -> float:
         for item in self._items.values():
             if item["status"] == "running":
@@ -2357,8 +2734,8 @@ class TaskList(tk.Frame):
 CHAT_FILTERS = ("全部", "频道", "群组", "私聊", "机器人")
 
 
-class FilterChipBar(tk.Frame):
-    """28px text tabs: selected = accent + bold + light pill; others are plain text."""
+class FilterChipBar(tk.Canvas):
+    """Win11 segmented filter: light track, white chip on the selected item."""
 
     def __init__(
         self,
@@ -2366,20 +2743,12 @@ class FilterChipBar(tk.Frame):
         command: Optional[Callable[[str], None]] = None,
         bg: str = C_BG,
     ) -> None:
-        super().__init__(master, bg=bg, height=28)
-        self.grid_propagate(False)
+        super().__init__(master, height=28, highlightthickness=0, bd=0, bg=bg, cursor="hand2")
         self._command = command
         self.value = "全部"
-        self._bg = bg
-        self._chips: dict[str, tk.Canvas] = {}
-        for i, label in enumerate(CHAT_FILTERS):
-            self.columnconfigure(i, weight=1, uniform="filt")
-            self.rowconfigure(0, weight=1)
-            chip = tk.Canvas(self, height=22, highlightthickness=0, bd=0, bg=bg, cursor="hand2")
-            chip.grid(row=0, column=i, padx=0, pady=3, sticky="nsew")
-            chip.bind("<Button-1>", lambda _e, v=label: self._pick(v))
-            chip.bind("<Configure>", lambda _e, v=label: self._draw_one(v))
-            self._chips[label] = chip
+        self._outer = bg
+        self.bind("<Configure>", lambda _e: self._redraw())
+        self.bind("<Button-1>", self._on_click)
         self._redraw()
 
     def set_value(self, value: str) -> None:
@@ -2395,25 +2764,29 @@ class FilterChipBar(tk.Frame):
         if self._command:
             self._command(value)
 
-    def _redraw(self) -> None:
-        for label in self._chips:
-            self._draw_one(label)
+    def _on_click(self, event: tk.Event) -> None:
+        width = max(1, int(self.winfo_width()))
+        slot = width / len(CHAT_FILTERS)
+        index = min(len(CHAT_FILTERS) - 1, max(0, int(event.x / slot)))
+        self._pick(CHAT_FILTERS[index])
 
-    def _draw_one(self, label: str) -> None:
-        chip = self._chips.get(label)
-        if chip is None:
-            return
-        active = label == self.value
-        width = max(8, int(chip.winfo_width()))
-        height = max(22, int(chip.winfo_height()) if chip.winfo_height() > 1 else 22)
-        chip.delete("all")
-        chip.configure(bg=self._bg)
-        if active:
-            rounded_rect(chip, 0.5, 0.5, width - 0.5, height - 0.5, height / 2, fill=C_SEL, outline=C_SEL)
-            fg, font = C_ACCENT, Fonts.aux_bold or Fonts.nav_active
-        else:
-            fg, font = C_TEXT2, Fonts.aux
-        chip.create_text(width / 2, height / 2, text=label, fill=fg, font=font)
+    def _redraw(self) -> None:
+        self.delete("all")
+        width = max(8, int(self.winfo_width()) if self.winfo_width() > 1 else 220)
+        height = 28
+        self.configure(bg=self._outer, height=height)
+        rounded_rect(self, 0, 0, width, height, 6, fill=C_FILTER_TRACK, outline=C_FILTER_TRACK)
+        slot = width / len(CHAT_FILTERS)
+        for i, label in enumerate(CHAT_FILTERS):
+            x1 = i * slot + 2
+            x2 = (i + 1) * slot - 2
+            active = label == self.value
+            if active:
+                rounded_rect(self, x1, 2, x2, height - 2, 4, fill="#FFFFFF", outline="#FFFFFF")
+                fg, font = C_TEXT, Fonts.aux_bold or Fonts.nav_active
+            else:
+                fg, font = C_TEXT2, Fonts.aux
+            self.create_text((x1 + x2) / 2, height / 2, text=label, fill=fg, font=font)
 
 
 class QualityPicker(tk.Frame):
@@ -2522,12 +2895,23 @@ class ModalDialog(tk.Toplevel):
         self._width = width
         self.resizable(False, False)
         self.title(title)
-        self.configure(bg=C_CARD)
+        self.configure(bg=C_CARD, highlightthickness=1, highlightbackground=C_STROKE)
         try:
             self.transient(master)
         except Exception:
             pass
+        try:
+            self.overrideredirect(True)
+        except tk.TclError:
+            pass
         apply_window_icon(self, getattr(master, "_icon_photos", []))
+
+        hd = tk.Frame(self, bg=C_CARD, height=TITLE_H)
+        hd.pack(fill="x")
+        hd.pack_propagate(False)
+        tk.Label(hd, text=title, bg=C_CARD, fg=C_TEXT, font=Fonts.title, anchor="w").pack(side="left", padx=16)
+        CaptionButton(hd, "close", self.hide, bg=C_CARD).pack(side="right")
+        tk.Frame(self, bg=C_STROKE, height=1).pack(fill="x")
 
         self.body = tk.Frame(self, bg=C_CARD, width=width)
         self.body.pack(fill="both", expand=True, padx=16, pady=(16, 18))
@@ -2553,15 +2937,18 @@ class ModalDialog(tk.Toplevel):
             owner.update_idletasks()
         except Exception:
             pass
-        self.deiconify()
         self.update_idletasks()
-        req_h = max(self.winfo_reqheight(), 120)
+        req_h = max(self.winfo_reqheight(), 160)
         try:
             x = owner.winfo_rootx() + max(0, (owner.winfo_width() - self._width) // 2)
             y = owner.winfo_rooty() + max(0, (owner.winfo_height() - req_h) // 2)
         except Exception:
             x, y = 120, 120
-        self.geometry(f"{self._width}x{req_h}+{x}+{y}")
+        geo = f"{self._width}x{req_h}+{int(x)}+{int(y)}"
+        self.geometry(geo)
+        self.deiconify()
+        self.update_idletasks()
+        self.geometry(geo)
         self.lift()
         try:
             self.grab_set()
@@ -2588,9 +2975,12 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("880x640")
-        self.minsize(760, 560)
+        self.geometry(f"{WINDOW_W}x{WINDOW_H}")
+        self.minsize(WINDOW_MIN_W, WINDOW_MIN_H)
         self.configure(bg=C_BG)
+        self._borderless = False
+        self._zoomed = False
+        self._zoom_restore = ""
         self._icon_photos: list = []
         self._tray = None
         self._tray_hint_shown = False
@@ -2638,6 +3028,8 @@ class App(tk.Tk):
         self._restore_unfinished_downloads()
         self._build_login_dialogs()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.bind_all("<Button-1>", self._maybe_hide_flyouts, add="+")
+        self.after_idle(self._apply_borderless)
         self.after(80, self._drain_ui_queue)
         self.after(120, self._bootstrap)
         self.after(200, self._start_tray)
@@ -2658,71 +3050,262 @@ class App(tk.Tk):
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
 
-        self.menu_account = tk.Menu(self, tearoff=0, font=Fonts.body)
-        self.menu_account.add_command(label="切换账号", command=self._switch_account)
-        self.menu_account.add_command(label="退出登录", command=self._logout)
+        self.account_flyout = MenuFlyout(
+            self,
+            [
+                ("代理", self._open_proxy, False),
+                ("切换账号", self._switch_account, False),
+                "-",
+                ("退出登录", self._logout, True),
+            ],
+        )
+        self.settings_flyout = MenuFlyout(
+            self,
+            [
+                ("代理", self._open_proxy, False),
+                ("关于", self._open_about, False),
+            ],
+        )
+
+        self._build_titlebar()
 
         body = tk.Frame(self, bg=C_BG)
-        body.grid(row=0, column=0, sticky="nsew")
+        body.grid(row=1, column=0, sticky="nsew")
         body.columnconfigure(1, weight=1)
         body.rowconfigure(0, weight=1)
 
         self._build_rail(body)
         self._build_main(body)
+        self._build_resize_grips()
+
+    def _build_titlebar(self) -> None:
+        bar = tk.Frame(self, bg=C_TITLE, height=TITLE_H)
+        self.titlebar = bar
+        bar.grid(row=0, column=0, sticky="ew")
+        bar.grid_propagate(False)
+        bar.columnconfigure(2, weight=1)
+
+        icon = self._load_title_icon()
+        self.lbl_title_icon = tk.Label(bar, image=icon, bg=C_TITLE) if icon is not None else tk.Label(bar, bg=C_TITLE)
+        self.lbl_title_icon.pack(side="left", padx=(14, 0))
+        self.lbl_title_name = tk.Label(bar, text=APP_NAME, bg=C_TITLE, fg=C_TEXT, font=Fonts.titlebar)
+        self.lbl_title_name.pack(side="left", padx=(8, 0))
+
+        caps = tk.Frame(bar, bg=C_TITLE)
+        caps.pack(side="right", fill="y")
+        CaptionButton(caps, "close", self._on_close, bg=C_TITLE).pack(side="right")
+        CaptionButton(caps, "max", self._toggle_zoom, bg=C_TITLE).pack(side="right")
+        CaptionButton(caps, "min", self._minimize, bg=C_TITLE).pack(side="right")
+
+        self.title_account = TitleAccount(bar, command=self._on_account_click, bg=C_TITLE)
+        self.title_account.pack(side="right", padx=(0, 8))
+        self._refresh_account_bar()
+
+        for widget in (bar, self.lbl_title_icon, self.lbl_title_name):
+            widget.bind("<Button-1>", self._title_drag_start)
+            widget.bind("<B1-Motion>", self._title_drag_move)
+            widget.bind("<Double-Button-1>", self._toggle_zoom)
+        tk.Frame(self, bg=C_STROKE, height=1).grid(row=0, column=0, sticky="sew")
+
+    def _load_title_icon(self) -> Optional[ImageTk.PhotoImage]:
+        png = resource_path("app-icon-64.png", "app-icon-256.png", "app-icon.ico")
+        if png is None:
+            return None
+        try:
+            img = Image.open(png).convert("RGBA").resize((18, 18), Image.Resampling.LANCZOS)
+            mask = Image.new("L", (18, 18), 0)
+            ImageDraw.Draw(mask).rounded_rectangle((0, 0, 17, 17), radius=4, fill=255)
+            img.putalpha(mask)
+            self._title_icon_img = ImageTk.PhotoImage(img)
+            return self._title_icon_img
+        except Exception:
+            return None
 
     def _refresh_account_bar(self) -> None:
-        if getattr(self, "nav_account", None) is not None:
-            self.nav_account.set_state(self._logged_in, self._account_name)
+        if getattr(self, "title_account", None) is not None:
+            self.title_account.set_state(self._logged_in, self._account_name)
 
     def _on_account_click(self) -> None:
         if self._logged_in:
-            self._popup(self.menu_account, self.nav_account)
+            if self.account_flyout.winfo_ismapped():
+                self.account_flyout.hide()
+            else:
+                self.settings_flyout.hide()
+                self.account_flyout.popup(self.title_account)
         else:
             self._open_login()
 
-    def _popup(self, menu: tk.Menu, anchor: tk.Widget) -> None:
-        try:
-            x = anchor.winfo_rootx()
-            y_below = anchor.winfo_rooty() + anchor.winfo_height()
+    def _on_settings_click(self) -> None:
+        if self.settings_flyout.winfo_ismapped():
+            self.settings_flyout.hide()
+        else:
+            self.account_flyout.hide()
+            self.settings_flyout.popup(self.nav_settings, above=True)
+
+    def _widget_is_under(self, widget: tk.Misc | None, parent: tk.Misc) -> bool:
+        while widget is not None:
+            if widget is parent:
+                return True
+            widget = getattr(widget, "master", None)
+        return False
+
+    def _maybe_hide_flyouts(self, event: tk.Event) -> None:
+        widget = event.widget
+        if not self._widget_is_under(widget, self.account_flyout) and widget is not getattr(self, "title_account", None):
+            self.account_flyout.hide()
+        settings = getattr(self, "nav_settings", None)
+        if not self._widget_is_under(widget, self.settings_flyout) and widget is not settings:
+            self.settings_flyout.hide()
+
+    def _title_drag_start(self, event: tk.Event) -> None:
+        self._drag_dx = event.x_root - self.winfo_x()
+        self._drag_dy = event.y_root - self.winfo_y()
+
+    def _title_drag_move(self, event: tk.Event) -> None:
+        if getattr(self, "_zoomed", False):
+            return
+        self.geometry(f"+{event.x_root - self._drag_dx}+{event.y_root - self._drag_dy}")
+
+    def _toggle_zoom(self, _event: tk.Event | None = None) -> None:
+        if self._zoomed:
+            if self._zoom_restore:
+                self.geometry(self._zoom_restore)
+            self._zoomed = False
+            return
+        self._zoom_restore = self.geometry()
+        self.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight()}+0+0")
+        self._zoomed = True
+
+    def _minimize(self) -> None:
+        if sys.platform == "win32":
             try:
-                end = menu.index("end")
-                count = 0 if end is None else int(end) + 1
+                self.overrideredirect(False)
+                self.iconify()
+                return
             except Exception:
-                count = 2
-            est = count * 28 + 16
-            screen_h = anchor.winfo_screenheight()
-            if y_below + est > screen_h - 12:
-                y = max(8, anchor.winfo_rooty() - est)
-            else:
-                y = y_below
-            menu.tk_popup(x, y)
-        finally:
-            menu.grab_release()
+                pass
+        self._on_close()
+
+    def _apply_borderless(self) -> None:
+        try:
+            self.update_idletasks()
+            geo = self.geometry()
+            self.overrideredirect(True)
+            if "+" not in geo:
+                geo = f"{WINDOW_W}x{WINDOW_H}+80+40"
+            self.geometry(geo)
+            self._borderless = True
+        except tk.TclError:
+            self._borderless = False
+            return
+        if sys.platform == "win32":
+            self._win_taskbar_and_mica()
+
+    def _toplevel_hwnd(self) -> int:
+        self.update_idletasks()
+        child = int(self.winfo_id())
+        if sys.platform != "win32":
+            return child
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.GetAncestor.restype = wintypes.HWND
+        root = user32.GetAncestor(child, 2)
+        return int(root or child)
+
+    def _win_taskbar_and_mica(self) -> None:
+        if sys.platform != "win32":
+            return
+        import ctypes
+        from ctypes import wintypes
+
+        try:
+            hwnd = self._toplevel_hwnd()
+            user32 = ctypes.windll.user32
+            GWL_EXSTYLE = -20
+            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            style = (style & ~0x00000080) | 0x00040000
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+            dwm = ctypes.windll.dwmapi
+            corner = ctypes.c_int(2)
+            dwm.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(corner), ctypes.sizeof(corner))
+            backdrop = ctypes.c_int(2)
+            dwm.DwmSetWindowAttribute(hwnd, 38, ctypes.byref(backdrop), ctypes.sizeof(backdrop))
+            # COLORREF is 0x00BBGGRR for #F9FAFD
+            caption = ctypes.c_int(0x00FDFAF9)
+            dwm.DwmSetWindowAttribute(hwnd, 35, ctypes.byref(caption), ctypes.sizeof(caption))
+        except Exception:
+            pass
+
+    def _build_resize_grips(self) -> None:
+        def bind(widget: tk.Widget, edge: str, cursor: str) -> None:
+            widget.configure(cursor=cursor)
+            widget.bind("<Button-1>", lambda e, edge=edge: self._grip_down(e, edge))
+            widget.bind("<B1-Motion>", self._grip_drag)
+
+        south = tk.Frame(self, bg=C_BG, height=6, cursor="sb_v_double_arrow")
+        south.grid(row=2, column=0, sticky="ew")
+        bind(south, "s", "sb_v_double_arrow")
+        east = tk.Frame(self, bg=C_BG, width=6, cursor="sb_h_double_arrow")
+        east.place(relx=1, rely=0, relheight=1, anchor="ne")
+        bind(east, "e", "sb_h_double_arrow")
+        corner = tk.Frame(self, bg=C_BG, width=12, height=12)
+        corner.place(relx=1, rely=1, anchor="se")
+        for cursor in ("size_nw_se", "bottom_right_corner", "sizing"):
+            try:
+                corner.configure(cursor=cursor)
+                break
+            except tk.TclError:
+                continue
+        bind(corner, "se", str(corner.cget("cursor") or "arrow"))
+
+    def _grip_down(self, event: tk.Event, edge: str) -> None:
+        self._grip_edge = edge
+        self._grip_x = event.x_root
+        self._grip_y = event.y_root
+        self._grip_geo = (self.winfo_x(), self.winfo_y(), self.winfo_width(), self.winfo_height())
+
+    def _grip_drag(self, event: tk.Event) -> None:
+        edge = getattr(self, "_grip_edge", "")
+        if not edge or self._zoomed:
+            return
+        x, y, w, h = self._grip_geo
+        dx = event.x_root - self._grip_x
+        dy = event.y_root - self._grip_y
+        nx, ny, nw, nh = x, y, w, h
+        if "e" in edge:
+            nw = max(WINDOW_MIN_W, w + dx)
+        if "s" in edge:
+            nh = max(WINDOW_MIN_H, h + dy)
+        if "w" in edge:
+            nw = max(WINDOW_MIN_W, w - dx)
+            nx = x + (w - nw)
+        if "n" in edge:
+            nh = max(WINDOW_MIN_H, h - dy)
+            ny = y + (h - nh)
+        self.geometry(f"{int(nw)}x{int(nh)}+{int(nx)}+{int(ny)}")
 
     def _build_rail(self, body: tk.Frame) -> None:
-        rail = tk.Frame(body, bg=C_BG, width=64)
+        rail = tk.Frame(body, bg=C_RAIL, width=RAIL_W)
         rail.grid(row=0, column=0, sticky="nsw")
         rail.grid_propagate(False)
         tk.Frame(body, bg=C_STROKE, width=1).grid(row=0, column=0, sticky="nse")
 
-        top = tk.Frame(rail, bg=C_BG)
+        top = tk.Frame(rail, bg=C_RAIL)
         top.pack(fill="x", padx=8, pady=(10, 0))
         self.nav_links = NavButton(top, "link", "链接", command=lambda: self._show_page("links"))
         self.nav_links.pack(pady=(0, 4))
         self.nav_chats = NavButton(top, "chat", "对话", command=lambda: self._show_page("chats"))
         self.nav_chats.pack()
 
-        bot = tk.Frame(rail, bg=C_BG)
+        bot = tk.Frame(rail, bg=C_RAIL)
         bot.pack(side="bottom", fill="x", padx=8, pady=(0, 12))
-        self.nav_proxy = NavButton(bot, "proxy", "代理", command=self._open_proxy)
-        self.nav_proxy.pack(pady=(0, 4))
-        self.nav_about = NavButton(bot, "about", "关于", command=self._open_about)
-        self.nav_about.pack(pady=(0, 4))
-        self.nav_account = AccountButton(bot, command=self._on_account_click)
-        self.nav_account.pack()
-        self._refresh_account_bar()
+        self.nav_settings = NavButton(bot, "settings", "设置", command=self._on_settings_click)
+        self.nav_settings.pack()
 
     def _build_main(self, body: tk.Frame) -> None:
         self.main = tk.Frame(body, bg=C_BG)
@@ -2768,6 +3351,7 @@ class App(tk.Tk):
             on_stop=self._request_stop,
             on_open_folder=self._open_folder,
             on_remove=self._on_remove_task,
+            on_stop_one=self._on_stop_one,
         )
         self.tasks.grid(row=2, column=0, sticky="nsew", padx=16, pady=(10, 0))
         self.main.rowconfigure(2, weight=1)
@@ -2776,7 +3360,7 @@ class App(tk.Tk):
         foot.grid(row=3, column=0, sticky="ew", padx=16, pady=(10, 12))
         foot.columnconfigure(1, weight=1)
         self.lbl_ready = tk.Label(foot, text="就绪", bg=C_BG, fg=C_TEXT2, font=Fonts.help)
-        self.btn_log = tk.Label(foot, text="▸  日志", bg=C_BG, fg=C_TEXT2, font=Fonts.help, cursor="hand2")
+        self.btn_log = tk.Label(foot, text="▸ 日志", bg=C_BG, fg=C_TEXT2, font=Fonts.help, cursor="hand2")
         self.btn_log.pack(side="left")
         self.btn_log.bind("<Button-1>", lambda _e: self._toggle_log())
         self.btn_clear_log = tk.Label(foot, text="清空", bg=C_BG, fg=C_ACCENT, font=Fonts.help, cursor="hand2")
@@ -2833,10 +3417,10 @@ class App(tk.Tk):
         self.txt_links.pack(fill="both", expand=True)
         actions = tk.Frame(f, bg=C_BG)
         actions.grid(row=1, column=0, sticky="ew", pady=(10, 0))
-        self.quality_links = QualityPicker(actions, self.var_quality, on_change=self._on_quality_change, bg=C_BG)
-        self.quality_links.pack(side="left")
         self.btn_dl_link = FlatButton(actions, "开始下载", command=self._on_download_link, variant="primary", bg=C_BG)
         self.btn_dl_link.pack(side="right")
+        self.quality_links = QualityPicker(actions, self.var_quality, on_change=self._on_quality_change, bg=C_BG)
+        self.quality_links.pack(side="right", padx=(0, 8))
 
     def _build_chat_page(self) -> None:
         f = tk.Frame(self.page_host, bg=C_BG)
@@ -2911,30 +3495,37 @@ class App(tk.Tk):
         self.video_body.columnconfigure(0, weight=1)
         self.video_body.rowconfigure(0, weight=1)
 
+        self.video_empty = tk.Frame(self.video_body, bg=C_CARD)
+        self._empty_icon = tk.Canvas(self.video_empty, width=40, height=40, highlightthickness=0, bd=0, bg=C_CARD)
+        self._empty_icon.pack()
+        rounded_rect(self._empty_icon, 0, 0, 40, 40, 12, fill="#F3F4F6", outline="#F3F4F6")
+        self._empty_glyph = make_nav_icon("chat", C_TEXT3, 18, self._empty_icon)
+        self._empty_icon.create_image(20, 20, image=self._empty_glyph)
         self.lbl_video_empty = tk.Label(
-            self.video_body,
+            self.video_empty,
             text="选择一个对话，查看可下载的视频",
             bg=C_CARD,
             fg=C_TEXT3,
             font=Fonts.body,
         )
-        self.lbl_video_empty.place(relx=0.5, rely=0.5, anchor="center")
+        self.lbl_video_empty.pack(pady=(10, 0))
+        self.video_empty.place(relx=0.5, rely=0.5, anchor="center")
 
         self.video_list = VideoList(self.video_body, on_toggle=lambda _item: self._sync_chat_actions())
 
-        foot = tk.Frame(right, bg=C_CARD, height=44)
+        foot = tk.Frame(right, bg=C_FOOT, height=44)
         self.video_footer = foot
         foot.grid_propagate(False)
         tk.Frame(foot, bg=C_STROKE, height=1).pack(fill="x")
-        bar = tk.Frame(foot, bg=C_CARD)
+        bar = tk.Frame(foot, bg=C_FOOT)
         bar.pack(fill="both", expand=True, padx=12, pady=5)
-        self.btn_load_more = FlatButton(bar, "加载更多", command=self._on_load_more, bg=C_CARD)
+        self.btn_load_more = FlatButton(bar, "加载更多", command=self._on_load_more, bg=C_FOOT)
         self.btn_load_more.pack(side="left")
         self.btn_dl_selected = FlatButton(
-            bar, "下载选中", command=self._on_download_selected, variant="primary", bg=C_CARD
+            bar, "下载选中", command=self._on_download_selected, variant="primary", bg=C_FOOT
         )
         self.btn_dl_selected.pack(side="right")
-        self.lbl_picked = tk.Label(bar, text="已选 0", bg=C_CARD, fg=C_TEXT2, font=Fonts.help)
+        self.lbl_picked = tk.Label(bar, text="已选 0", bg=C_FOOT, fg=C_TEXT2, font=Fonts.help)
         self.lbl_picked.pack(side="right", padx=(0, 10))
         self._sync_quality_options()
 
@@ -2942,10 +3533,10 @@ class App(tk.Tk):
         if self.video_list.winfo_ismapped():
             self.video_list.pack_forget()
         self.lbl_video_empty.configure(text=text)
-        self.lbl_video_empty.place(relx=0.5, rely=0.5, anchor="center")
+        self.video_empty.place(relx=0.5, rely=0.5, anchor="center")
 
     def _show_video_list(self) -> None:
-        self.lbl_video_empty.place_forget()
+        self.video_empty.place_forget()
         if not self.video_list.winfo_ismapped():
             self.video_list.pack(fill="both", expand=True)
 
@@ -3165,13 +3756,13 @@ class App(tk.Tk):
     def _toggle_log(self) -> None:
         self._log_open = not self._log_open
         if self._log_open:
-            self.btn_log.configure(text="▾  日志")
+            self.btn_log.configure(text="▾ 日志")
             self.log_wrap.grid(row=4, column=0, sticky="nsew", padx=16, pady=(0, 12))
             self.main.rowconfigure(4, weight=0)
             if not self.btn_clear_log.winfo_ismapped():
                 self.btn_clear_log.pack(side="right")
         else:
-            self.btn_log.configure(text="▸  日志")
+            self.btn_log.configure(text="▸ 日志")
             self.log_wrap.grid_forget()
             if self.btn_clear_log.winfo_ismapped():
                 self.btn_clear_log.pack_forget()
@@ -3276,8 +3867,7 @@ class App(tk.Tk):
         self._form_label(grid, "api_hash").grid(row=1, column=0, sticky="e", padx=(0, 10))
         self.var_api_hash = tk.StringVar(value=str(self.cfg.get("api_hash") or ""))
         self._form_entry(grid, self.var_api_hash, placeholder="从申请页复制").grid(row=1, column=1, sticky="ew")
-        FlatButton(b, "打开申请页", command=self._open_api_site, bg=C_CARD).pack(anchor="w", pady=(12, 12))
-        self._form_help(b, "只保存在本机，请不要发给别人。").pack(fill="x")
+        self._form_help(b, "只保存在本机，请不要发给别人。").pack(fill="x", pady=(12, 0))
         ft = tk.Frame(b, bg=C_CARD)
         ft.pack(fill="x", pady=(16, 0))
         FlatButton(ft, "保存并继续", command=self._save_api, variant="primary", bg=C_CARD).pack(side="right")
@@ -3290,8 +3880,8 @@ class App(tk.Tk):
         self._form_label(b, "手机号").pack(fill="x")
         self.var_phone = tk.StringVar()
         self._form_entry(b, self.var_phone, placeholder="11 位手机号，或 +区号").pack(fill="x", pady=(6, 6))
-        self._form_help(b, "与官方 Telegram 同一号码，大陆会自动加 +86。将使用已保存的 API 凭据。").pack(fill="x")
-        self._link_label_action(b, "修改 API 凭据", self._open_api_from_phone).pack(anchor="w", pady=(8, 0))
+        self._form_help(b, "与官方 Telegram 同一号码，大陆会自动加 +86。").pack(fill="x")
+        self._link_label_action(b, "更改 API 凭据", self._open_api_from_phone).pack(anchor="w", pady=(8, 0))
         ft = tk.Frame(b, bg=C_CARD)
         ft.pack(fill="x", pady=(16, 0))
         FlatButton(ft, "发送验证码", command=self._send_code, variant="primary", bg=C_CARD).pack(side="right")
@@ -3360,6 +3950,7 @@ class App(tk.Tk):
 
         self.lbl_proxy_status = tk.Label(b, text="", bg=C_CARD, fg=C_TEXT2, font=Fonts.help, anchor="w", justify="left", wraplength=400)
         self.lbl_proxy_status.pack(fill="x", pady=(12, 0))
+        tk.Label(b, text="改完需重启再生效", bg=C_CARD, fg=C_TEXT3, font=Fonts.help, anchor="w").pack(fill="x", pady=(6, 0))
 
         ft = tk.Frame(b, bg=C_CARD)
         ft.pack(fill="x", pady=(16, 0))
@@ -3375,10 +3966,14 @@ class App(tk.Tk):
         b = self.dlg_about.body
         row = tk.Frame(b, bg=C_CARD)
         row.pack(fill="x")
-        ic = tk.Canvas(row, width=36, height=36, highlightthickness=0, bd=0, bg=C_CARD)
-        ic.pack(side="left")
-        rounded_rect(ic, 0, 0, 36, 36, 8, fill=C_ACCENT, outline=C_ACCENT)
-        draw_download_icon(ic, 9, 9, "#FFFFFF", 18)
+        about_icon = self._load_about_icon()
+        if about_icon is not None:
+            tk.Label(row, image=about_icon, bg=C_CARD).pack(side="left")
+        else:
+            ic = tk.Canvas(row, width=40, height=40, highlightthickness=0, bd=0, bg=C_CARD)
+            ic.pack(side="left")
+            rounded_rect(ic, 0, 0, 40, 40, 8, fill=C_ACCENT, outline=C_ACCENT)
+            draw_download_icon(ic, 11, 11, "#FFFFFF", 18)
         texts = tk.Frame(row, bg=C_CARD)
         texts.pack(side="left", padx=12)
         tk.Label(texts, text=APP_NAME, bg=C_CARD, fg=C_TEXT, font=Fonts.title, anchor="w").pack(anchor="w")
@@ -3524,11 +4119,16 @@ class App(tk.Tk):
         self.var_api_hash.set(str(self.cfg.get("api_hash") or ""))
         self._show_dialog(self.dlg_api)
 
-    def _open_api_site(self) -> None:
+    def _load_about_icon(self) -> Optional[ImageTk.PhotoImage]:
+        png = resource_path("app-icon-64.png", "app-icon-256.png")
+        if png is None:
+            return None
         try:
-            webbrowser.open("https://my.telegram.org")
-        except Exception as exc:
-            messagebox.showerror(APP_NAME, explain_error(exc), parent=self.dlg_api)
+            img = Image.open(png).convert("RGBA").resize((40, 40), Image.Resampling.LANCZOS)
+            self._about_icon_img = ImageTk.PhotoImage(img)
+            return self._about_icon_img
+        except Exception:
+            return None
 
     def _fill_proxy_vars(self, item: dict) -> None:
         kind = str(item.get("type") or "socks5")
@@ -3940,9 +4540,58 @@ class App(tk.Tk):
     def _collect_links(self) -> list[str]:
         return split_link_text(self.txt_links.get_text())
 
+    def _confirm_delete(self, name: str) -> bool:
+        result = {"ok": False}
+        done = tk.BooleanVar(self, value=False)
+        dlg = ModalDialog(self, "删除任务", width=420)
+
+        def finish(ok: bool) -> None:
+            if done.get():
+                return
+            result["ok"] = ok
+            try:
+                dlg.grab_release()
+            except Exception:
+                pass
+            try:
+                dlg.withdraw()
+            except Exception:
+                pass
+            done.set(True)
+
+        dlg.set_on_hide(lambda: finish(False))
+        tk.Label(
+            dlg.body,
+            text=f"确定删除「{name}」？",
+            bg=C_CARD,
+            fg=C_TEXT,
+            font=Fonts.body,
+            anchor="w",
+            justify="left",
+            wraplength=380,
+        ).pack(fill="x")
+        ft = tk.Frame(dlg.body, bg=C_CARD)
+        ft.pack(fill="x", pady=(18, 0))
+        FlatButton(ft, "删除", command=lambda: finish(True), variant="danger", bg=C_CARD).pack(side="right")
+        FlatButton(ft, "取消", command=lambda: finish(False), bg=C_CARD).pack(side="right", padx=(0, 8))
+        dlg.show()
+        self.wait_variable(done)
+        try:
+            dlg.destroy()
+        except Exception:
+            pass
+        return result["ok"]
+
+    def _on_stop_one(self, key: str) -> None:
+        self.queue.halt(key)
+        self._paint_task(key)
+        self._refresh_task_header(done=not self._busy)
+
     def _on_remove_task(self, key: str) -> None:
         item = self.queue.get(key)
-        label = (item.url or item.name) if item else key
+        label = ((item.name or item.url) if item else "") or key
+        if not self._confirm_delete(label):
+            return
         action = self.queue.remove(key)
         self.tasks.remove(key)
         if action == "cancelled":
@@ -4090,7 +4739,7 @@ class App(tk.Tk):
                 self._ui_log("已停止。")
                 self._ui(self._mark_remaining_stopped)
                 break
-            if self.queue.cancelled(key):
+            if self.queue.cancelled(key) or self.queue.halted(key):
                 continue
             parsed = job.parsed
             self._set_task(key, parsed.raw, "running", url=parsed.raw)
@@ -4136,7 +4785,7 @@ class App(tk.Tk):
                         self._ui_log("已停止。")
                         self._ui(self._mark_remaining_stopped)
                         return
-                    if self.queue.cancelled(key) or self.queue.cancelled(child):
+                    if self.queue.cancelled(key) or self.queue.cancelled(child) or self.queue.halted(child):
                         continue
                     name = task_display_name(msg, title)
                     try:
@@ -4166,6 +4815,9 @@ class App(tk.Tk):
                             continue
                         if is_user_stop(exc):
                             self._ui_log("已停止。")
+                            if self._row_stop_only(child):
+                                self._ui(lambda k=child: self._paint_task(k))
+                                continue
                             self._ui(self._mark_remaining_stopped)
                             return
                         fail += 1
@@ -4177,6 +4829,9 @@ class App(tk.Tk):
                     continue
                 if is_user_stop(exc):
                     self._ui_log("已停止。")
+                    if self._row_stop_only(key):
+                        self._ui(lambda k=key: self._paint_task(k))
+                        continue
                     self._ui(self._mark_remaining_stopped)
                     break
                 fail += 1
@@ -4394,7 +5049,7 @@ class App(tk.Tk):
                 self._ui_log("已停止。")
                 self._ui(self._mark_remaining_stopped)
                 break
-            if self.queue.cancelled(key):
+            if self.queue.cancelled(key) or self.queue.halted(key):
                 continue
             kind = message_video_kind(msg)
             name = task_display_name(msg, title)
@@ -4414,6 +5069,9 @@ class App(tk.Tk):
                     continue
                 if is_user_stop(exc):
                     self._ui_log("已停止。")
+                    if self._row_stop_only(key):
+                        self._ui(lambda k=key: self._paint_task(k))
+                        continue
                     self._ui(self._mark_remaining_stopped)
                     break
                 fail += 1
@@ -4449,7 +5107,7 @@ class App(tk.Tk):
             speed = cur / elapsed
 
             def _upd() -> None:
-                if task_key and not self.queue.cancelled(task_key):
+                if task_key and not self.queue.cancelled(task_key) and not self.queue.halted(task_key):
                     self.queue.upsert(
                         task_key, name, "running", url=source_url, current=cur, total=tot or known, speed=speed
                     )
@@ -4459,7 +5117,11 @@ class App(tk.Tk):
             self._ui(_upd)
 
         def _cancelled() -> bool:
-            return self._stop_flag.is_set() or bool(task_key and self.queue.cancelled(task_key))
+            if self._stop_flag.is_set():
+                return True
+            if not task_key:
+                return False
+            return self.queue.cancelled(task_key) or self.queue.halted(task_key)
 
         while True:
             if _cancelled():
@@ -4477,17 +5139,53 @@ class App(tk.Tk):
             except FloodWaitError as exc:
                 seconds = int(getattr(exc, "seconds", 0) or 0)
                 self._ui_log(f"请求过于频繁，自动等待 {seconds} 秒后再继续…（可点停止）")
-                await self._sleep_interruptible(seconds, should_cancel=_cancelled)
+                await self._sleep_interruptible(seconds, should_cancel=_cancelled, task_key=task_key)
+                if _cancelled():
+                    raise UserFacingError("已停止。")
 
-    async def _sleep_interruptible(self, seconds: int, should_cancel: Optional[Callable[[], bool]] = None) -> None:
-        left = seconds
+    def _row_stop_only(self, key: str) -> bool:
+        return bool(key) and self.queue.halted(key) and not self._stop_flag.is_set()
+
+    def _show_flood_wait(self, key: str, seconds: int) -> None:
+        text = flood_wait_text(seconds)
+        item = self.queue.get(key) if key else None
+        if item is not None and not self.queue.halted(key) and not self.queue.cancelled(key):
+            if seconds > 0:
+                self.tasks.upsert(
+                    key,
+                    item.name,
+                    "waiting",
+                    current=item.current,
+                    total=item.total,
+                    speed=0.0,
+                    error=text,
+                )
+            else:
+                self.tasks.upsert(
+                    key,
+                    item.name,
+                    "running",
+                    current=item.current,
+                    total=item.total,
+                    speed=0.0,
+                )
+        self._refresh_task_header()
+
+    async def _sleep_interruptible(
+        self,
+        seconds: int,
+        should_cancel: Optional[Callable[[], bool]] = None,
+        task_key: str = "",
+    ) -> None:
+        left = max(0, int(seconds))
         while left > 0 and not self._stop_flag.is_set():
             if should_cancel and should_cancel():
                 return
+            self._ui(lambda l=left, k=task_key: self._show_flood_wait(k, l))
             step = min(1, left)
             await asyncio.sleep(step)
             left -= step
-            self._ui(lambda l=left: self.tasks.set_header("限流等待中…", f"剩余 {l} 秒", show_stop=True))
+        self._ui(lambda l=left, k=task_key: self._show_flood_wait(k, l))
 
     def _mark_remaining_stopped(self) -> None:
         self.queue.mark_stopped()
@@ -4507,6 +5205,15 @@ class App(tk.Tk):
         self._refresh_task_header(done=True)
 
     def _refresh_task_header(self, done: bool = False, ok: int = 0, fail: int = 0) -> None:
+        summary = self.tasks.summary()
+        running = summary.get("running", 0)
+        waiting = summary.get("waiting", 0)
+        stopped = summary.get("stopped", 0)
+        queued = summary.get("queued", 0)
+        finished = summary.get("done", 0) + summary.get("error", 0) + stopped
+        total = sum(summary.values())
+        speed = self.tasks.current_speed()
+        speed_text = format_speed(speed) if speed else ""
         if done:
             show_open = bool(ok or self.tasks.has_items())
             if fail or ok:
@@ -4515,12 +5222,20 @@ class App(tk.Tk):
                 title = "已停止" if self._stop_flag.is_set() else "就绪"
                 self.tasks.set_header(title, show_stop=False, show_open=show_open and self._stop_flag.is_set())
             return
-        _done, running, total = self.tasks.counts()
+        if waiting or (stopped and (running or waiting)):
+            parts = []
+            if running:
+                parts.append(f"下载中 {running}")
+            if waiting:
+                parts.append(f"等待 {waiting}")
+            if stopped:
+                parts.append(f"已停止 {stopped}")
+            title = " · ".join(parts) if parts else "下载中"
+            self.tasks.set_header(title, speed=speed_text, show_stop=bool(running or waiting or queued or self._busy))
+            return
         if self._busy and total:
-            idx = min(_done + (1 if running else 0), total) or total
-            speed = self.tasks.current_speed()
-            meta = f"·  {format_speed(speed)}" if speed else ""
-            self.tasks.set_header(f"下载中 {idx}/{total}", meta, show_stop=True)
+            idx = min(finished + (1 if running or waiting else 0), total) or total
+            self.tasks.set_header(f"下载中 {idx}/{total}", speed=speed_text, show_stop=True)
         elif total:
             self.tasks.set_header("就绪", show_stop=False)
         else:
@@ -4668,6 +5383,8 @@ class App(tk.Tk):
             return
         try:
             menu = pystray.Menu(
+                pystray.MenuItem(APP_NAME, None, enabled=False),
+                pystray.Menu.SEPARATOR,
                 pystray.MenuItem("打开主窗口", self._tray_show, default=True),
                 pystray.MenuItem("退出", self._tray_exit),
             )
@@ -4698,6 +5415,12 @@ class App(tk.Tk):
                 self.state("normal")
             except Exception:
                 pass
+            if self._borderless:
+                try:
+                    self.overrideredirect(True)
+                except Exception:
+                    pass
+                self._win_taskbar_and_mica()
             self.lift()
             self.focus_force()
             apply_window_icon(self, self._icon_photos)

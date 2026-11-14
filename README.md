@@ -13,7 +13,7 @@
 
 ## 快速开始（推荐：安装包）
 
-1. 从本仓库 [Releases](../../releases) 下载 `TGVideoDownloader-Setup-1.3.16.exe`，或使用本地打包结果 `dist/TGVideoDownloader-Setup-1.3.16.exe`。
+1. 从本仓库 [Releases](../../releases) 下载 `TGVideoDownloader-Setup-1.3.15.exe`，或使用本地打包结果 `dist/TGVideoDownloader-Setup-1.3.15.exe`。
 2. 双击安装包，按向导选择安装目录（默认在 `C:\Program Files\TGVideoDownloader`，也可改到任意磁盘），可选创建桌面快捷方式。
 3. 首次运行时，Windows 可能提示“已保护你的电脑”（未做代码签名），点 **更多信息** → **仍要运行**。
 4. 按下面步骤申请 `api_id` / `api_hash`，再用同一手机号完成登录。
@@ -23,7 +23,7 @@
 
 ### 便携版
 
-若不希望安装，可下载 `TGVideoDownloader-Portable-1.3.16.zip`，解压到任意文件夹后双击 `TGVideoDownloader.exe`。便携版会把登录会话和下载文件写在 exe 旁边的 `data`、`downloads` 里。
+若不希望安装，可下载 `TGVideoDownloader-Portable-1.3.15.zip`，解压到任意文件夹后双击 `TGVideoDownloader.exe`。便携版会把登录会话和下载文件写在 exe 旁边的 `data`、`downloads` 里。
 
 ### 本地打包
 
@@ -181,6 +181,7 @@ tg-video-downloader/
 
 ### 1.3.16
 
+- 界面改为已定稿的浅色 Fluent：窗口 960×680，窗底 `#F3F4F8`，强调色 `#005FB8`，顶栏和侧栏用浅云母底。关于窗口显示 1.3.16。没有深色模式，也没有界面风格开关。安装包文件名仍是已发布的 1.3.15，要等正式发布再改。
 - 频道和群组里的视频列得更全：除了普通视频、圆形视频和动态 GIF，也会列出按文件发送的视频、网页里附带的视频文件和实况照片。搜索索引没给出、或 Telegram 不提供文件时，会在列表或说明里写清原因，不再静默丢掉。翻页从上次检查到的位置继续，不会因为一页没凑满就停住。
 - 链接下载列表可以删除：排队、已停止、失败、已完成都能直接移除；正在下载的会先取消再移除。无效链接或下载失败时，错误里会写明是哪一条链接。
 - 退出后重新打开，未下完的链接（排队、已停止、失败、关闭时还在下载的）会恢复。正在下载的会变成已停止，不会假装还在跑，也不会自动接着下。已完成的不回到任务列表。
