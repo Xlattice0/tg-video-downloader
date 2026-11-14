@@ -15,7 +15,7 @@ import time
 import traceback
 import webbrowser
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 import sv_ttk
 import tkinter as tk
@@ -42,54 +42,185 @@ from tgcore import (
     clear_credentials,
     clear_session_only,
     detect_local_proxies,
+    DOWNLOAD_INDEX_PATH,
+    QUEUE_PATH,
+    DownloadQueue,
+    VideoScanState,
     explain_error,
+    filter_dialogs,
     format_bytes,
     format_date_short,
     format_datetime,
     format_duration_short,
     format_proxy_label,
     format_speed,
+    apply_downloaded_marks,
+    canonical_peer_id,
     has_api_credentials,
-    kind_label,
+    is_user_stop,
+    link_failure_text,
     load_cached_avatar,
     load_config,
+    load_download_records,
+    login_dialog_after_session_loss,
     message_video_kind,
     original_media_name,
-    parse_telegram_link,
+    primary_document_id,
     pick_best_proxy,
     pick_video_quality,
+    plan_link_jobs,
     proxy_from_config,
+    quality_label,
     quality_pref_label,
     quality_pref_value,
+    record_download,
+    restored_link_text,
+    split_link_text,
+    startup_login_target,
     test_proxy_connection,
     update_config,
+    validate_proxy_settings,
     video_display_title,
+    visible_chat_selection,
 )
 
 # ------------------------------------------------------------------ palette
-C_BG = "#F3F3F3"
+# Fluent 2 light. rgba(0,0,0,.08) on white is #EBEBEB. One light theme only.
+C_BG = "#F3F4F8"
 C_CARD = "#FFFFFF"
-C_TITLE = "#F9F9F9"
+C_TITLE = "#F9FAFD"
+C_RAIL = "#F3F4F9"
 C_TEXT = "#1A1A1A"
-C_TEXT2 = "#5D5D5D"
+C_TEXT2 = "#5C5C5C"
 C_TEXT3 = "#8A8A8A"
-C_STROKE = "#E5E5E5"
-C_STROKE2 = "#D1D1D1"
-C_ACCENT = "#0F6CBD"
-C_HOVER = "#115EA3"
-C_SEL = "#E6F2FB"
+C_STROKE = "#EBEBEB"
+C_STROKE2 = "#D0D0D0"
+C_ACCENT = "#005FB8"
+C_HOVER = "#0056A5"
+C_PRESS = "#004E93"
+C_SEL = "#EBF3FC"
+C_SEL_2 = "#D6E8F8"
 C_OK = "#0F7B0F"
+C_OK_SOFT = "#E7F4E7"
 C_ERR = "#C42B1C"
-C_BAR = "#EEEEEE"
+C_BAR = "#E6E6E6"
+C_WAIT = "#8A6A1A"
+C_WAIT_BG = "#FBF4E0"
+C_WAIT_BAR = "#C49214"
 C_BADGE = "#F1F1F1"
-C_BADGE_SEL = "#D7E8F6"
+C_BADGE_SEL = "#D6E8F8"
+C_PILL = "#EBF3FC"
+C_FOOT = "#FAFAFB"
+C_FILTER_TRACK = "#ECEEF2"
+C_ICON_MUTED = "#F0F0F0"
 AVATAR_COLORS = ("#5B7C99", "#6B8F71", "#8A6D4A", "#7A6B99", "#6A7A8A")
+
+WINDOW_W = 960
+WINDOW_H = 680
+WINDOW_MIN_W = 760
+WINDOW_MIN_H = 560
+RAIL_W = 68
+TITLE_H = 40
+CTRL_H = 32
+CTRL_RADIUS = 4
+CARD_RADIUS = 8
+NAV_W = 52
+NAV_H = 58
+
+UI_TOKENS = {
+    "window": (WINDOW_W, WINDOW_H),
+    "min_window": (WINDOW_MIN_W, WINDOW_MIN_H),
+    "bg": C_BG,
+    "card": C_CARD,
+    "title": C_TITLE,
+    "rail": C_RAIL,
+    "text": C_TEXT,
+    "text_secondary": C_TEXT2,
+    "text_muted": C_TEXT3,
+    "stroke": C_STROKE,
+    "control_border": C_STROKE2,
+    "accent": C_ACCENT,
+    "accent_hover": C_HOVER,
+    "selected": C_SEL,
+    "success": C_OK,
+    "error": C_ERR,
+    "wait_bg": C_WAIT_BG,
+    "wait_bar": C_WAIT_BAR,
+    "pill": C_PILL,
+    "rail_width": RAIL_W,
+    "control_height": CTRL_H,
+    "control_radius": CTRL_RADIUS,
+    "card_radius": CARD_RADIUS,
+    "about_version": APP_VERSION,
+}
 
 PROXY_LABEL_TO_KIND = {"直连": "none", "SOCKS5": "socks5", "HTTP": "http"}
 PROXY_KIND_TO_LABEL = {v: k for k, v in PROXY_LABEL_TO_KIND.items()}
 PROXY_KIND_TO_LABEL["off"] = "直连"
 PROXY_KIND_TO_LABEL["direct"] = "直连"
 PROXY_KIND_TO_LABEL[""] = "直连"
+
+
+def flood_wait_text(seconds: int) -> str:
+    """限流倒计时，显示在任务行上，例如「等待 32 秒」。"""
+    return f"等待 {max(0, int(seconds))} 秒"
+
+
+def stopped_display(error: str = "") -> str:
+    """恢复或中断的任务显示「已停止」，未完成的补上「上次未完成」。"""
+    text = (error or "").strip()
+    if "未下完" in text or "未完成" in text:
+        return "已停止 上次未完成"
+    if not text:
+        return "已停止"
+    if text.startswith("已停止"):
+        return text
+    return f"已停止 {text}"
+
+
+def task_row_status_text(
+    status: str,
+    error: str = "",
+    speed: float = 0.0,
+    total: int = 0,
+    current: int = 0,
+) -> str:
+    if status == "done":
+        return format_bytes(total or current) if (total or current) else ""
+    if status == "waiting":
+        return error or flood_wait_text(0)
+    if status == "stopped":
+        return stopped_display(error)
+    if status == "queued":
+        return "排队中"
+    if status == "error":
+        return error or "失败"
+    if speed:
+        return format_speed(speed)
+    return "下载中"
+
+
+def video_row_subtitle(item: VideoItem, pref: Optional[str] = None) -> str:
+    """清晰度已知时写成「1080p · 42.6 MB · 今天 16:08」，未知则只有体积和日期。"""
+    chosen = pick_video_quality(item.qualities or [], pref)
+    size = chosen.size if chosen and chosen.size else item.size
+    parts: list[str] = []
+    label = ""
+    if chosen is not None and chosen.label and chosen.label not in ("原画", "最高"):
+        label = chosen.label
+    elif item.width and item.height:
+        guessed = quality_label(item.width, item.height)
+        if guessed and guessed not in ("原画", "最高"):
+            label = guessed
+    if label:
+        parts.append(label)
+    parts.append(format_bytes(size))
+    parts.append(format_date_short(item.date))
+    if item.note:
+        parts.append(item.note)
+    elif not item.downloadable:
+        parts.append("无法下载")
+    return " · ".join(p for p in parts if p)
 
 
 def resource_path(*names: str) -> Optional[Path]:
@@ -368,7 +499,7 @@ def _tray_image():
 
     path = resource_path("app-icon.ico", "app-icon-64.png", "app-icon-256.png")
     if path is None:
-        return _Image.new("RGBA", (32, 32), (15, 108, 189, 255))
+        return _Image.new("RGBA", (32, 32), (0, 95, 184, 255))
     img = _Image.open(path)
     best = None
     try:
@@ -422,6 +553,159 @@ def ui_scale(widget: Optional[tk.Misc] = None) -> float:
 
 def scaled_px(logical: int, widget: Optional[tk.Misc] = None) -> int:
     return max(1, int(round(logical * ui_scale(widget))))
+
+
+def geometry_managed(widget: tk.Widget) -> bool:
+    """True when pack/grid/place is managing the widget.
+
+    ``winfo_ismapped`` is false whenever a parent is withdrawn or not on the
+    current page, so it cannot decide whether a button should be unpacked.
+    """
+    try:
+        return bool(widget.winfo_manager())
+    except tk.TclError:
+        return False
+
+
+# Microsoft YaHei UI draws Chinese clearly and its Latin matches Segoe UI.
+# Segoe UI is the fallback when YaHei is not installed (non-Chinese Windows).
+UI_FONT_CANDIDATES = (
+    "Microsoft YaHei UI",
+    "Microsoft YaHei",
+    "微软雅黑",
+    "Segoe UI",
+    "Noto Sans CJK SC",
+    "Noto Sans SC",
+    "PingFang SC",
+    "WenQuanYi Micro Hei",
+    "Droid Sans Fallback",
+)
+
+
+def choose_ui_font(families: Iterable[str]) -> str:
+    available = set(families)
+    for name in UI_FONT_CANDIDATES:
+        if name in available:
+            return name
+    return "TkDefaultFont"
+
+
+def enable_windows_dpi_awareness() -> str:
+    """Stop Windows from bitmap-stretching a Tk window.
+
+    On a scaled display, a DPI-unaware process is stretched as a bitmap, which
+    is the usual reason Tk text looks fuzzy. This has to run before the first
+    window. Returns the mode that was set, or "" when this is not Windows or
+    awareness was already chosen (for example by the exe manifest).
+    """
+    if sys.platform != "win32":
+        return ""
+    import ctypes
+
+    try:
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return "per-monitor-v2"
+    except Exception:
+        pass
+    try:
+        # PROCESS_PER_MONITOR_DPI_AWARE = 2
+        if int(ctypes.windll.shcore.SetProcessDpiAwareness(2)) == 0:
+            return "per-monitor"
+    except Exception:
+        pass
+    try:
+        if ctypes.windll.user32.SetProcessDPIAware():
+            return "system"
+    except Exception:
+        pass
+    return ""
+
+
+def apply_tk_dpi_scaling(root: tk.Misc) -> float:
+    """Point Tk at the real monitor DPI so it does not paint at 96 and scale up.
+
+    Returns the ratio versus 96 DPI. Values within 5% of 1 stay exactly 1 so a
+    normal 96 DPI desktop keeps the designed pixel layout.
+    """
+    try:
+        ppi = float(root.winfo_fpixels("1i"))
+    except Exception:
+        ppi = 96.0
+    if ppi < 48 or ppi > 800:
+        ppi = 96.0
+    scale = ppi / 96.0
+    if abs(scale - 1.0) < 0.05:
+        scale = 1.0
+        ppi = 96.0
+    try:
+        root.tk.call("tk", "scaling", ppi / 72.0)
+    except Exception:
+        pass
+    return scale
+
+
+def sharp_px(logical: int, scale: float = 1.0) -> int:
+    """Integer device pixels. Fractional font sizes and coordinates look soft."""
+    return max(1, int(round(float(logical) * max(1.0, float(scale)))))
+
+
+def ui_px(logical: int) -> int:
+    return sharp_px(logical, getattr(Fonts, "scale", 1.0) or 1.0)
+
+
+def snap_text_xy(x: float, y: float) -> tuple[int, int]:
+    return int(round(float(x))), int(round(float(y)))
+
+
+def canvas_text(canvas: tk.Canvas, x: float, y: float, **kwargs: Any) -> int:
+    sx, sy = snap_text_xy(x, y)
+    return canvas.create_text(sx, sy, **kwargs)
+
+
+def chrome_action(kind: str) -> str:
+    """Minimize keeps a taskbar button. Only the close button hides to the tray."""
+    if kind == "close":
+        return "tray"
+    if kind == "minimize":
+        return "taskbar"
+    raise ValueError(kind)
+
+
+def chat_download_action(busy: bool) -> str:
+    """A download already running must not block selecting and starting another."""
+    return "enqueue" if busy else "start"
+
+
+def merge_queue_keys(seed_keys: Iterable[str], preserved_keys: Iterable[str]) -> list[str]:
+    """Keep videos queued while a batch is starting, without duplicating keys."""
+    order: list[str] = []
+    seen: set[str] = set()
+    for key in list(seed_keys) + list(preserved_keys):
+        if key and key not in seen:
+            seen.add(key)
+            order.append(key)
+    return order
+
+
+def apply_ui_font_defaults(root: tk.Misc) -> None:
+    """Use the UI face for Tk's built-in fonts so dialogs are not a bitmap face."""
+    family = getattr(Fonts, "family", None) or "TkDefaultFont"
+    size = -ui_px(12)
+    for name in (
+        "TkDefaultFont",
+        "TkTextFont",
+        "TkMenuFont",
+        "TkHeadingFont",
+        "TkCaptionFont",
+        "TkSmallCaptionFont",
+        "TkIconFont",
+        "TkTooltipFont",
+    ):
+        try:
+            tkfont.nametofont(name).configure(family=family, size=size)
+        except tk.TclError:
+            pass
 
 
 def first_glyph(title: str) -> str:
@@ -517,6 +801,7 @@ def bind_mousewheel(widget: tk.Widget, target: "ScrollArea | tk.Canvas") -> None
 
 class Fonts:
     family = "Microsoft YaHei UI"
+    scale = 1.0
     title: Any = None
     body: Any = None
     body_bold: Any = None
@@ -530,19 +815,13 @@ class Fonts:
 
     @classmethod
     def init(cls, root: tk.Tk) -> None:
-        preferred = (
-            "Microsoft YaHei UI",
-            "Microsoft YaHei",
-            "Noto Sans CJK SC",
-            "Noto Sans SC",
-            "PingFang SC",
-            "Segoe UI",
-        )
-        available = set(tkfont.families(root))
-        cls.family = next((n for n in preferred if n in available), "TkDefaultFont")
+        cls.scale = apply_tk_dpi_scaling(root)
+        cls.family = choose_ui_font(tkfont.families(root))
 
         def make(size: int, weight: str = "normal") -> tkfont.Font:
-            return tkfont.Font(root=root, family=cls.family, size=-size, weight=weight)
+            # Negative size is pixels, so GDI rasterizes at device pixels
+            # instead of scaling a 96 DPI bitmap.
+            return tkfont.Font(root=root, family=cls.family, size=-ui_px(size), weight=weight)
 
         cls.titlebar = make(12, "bold")
         cls.title = make(13, "bold")
@@ -554,6 +833,7 @@ class Fonts:
         cls.nav = make(11)
         cls.nav_active = make(11, "bold")
         cls.badge = make(10)
+        apply_ui_font_defaults(root)
 
 
 class PlaceholderEntry(tk.Entry):
@@ -701,6 +981,15 @@ class PlaceholderText(tk.Text):
             return ""
         return self.get("1.0", "end-1c")
 
+    def set_text(self, text: str) -> None:
+        if text:
+            self._showing = False
+            self.configure(fg=C_TEXT)
+            self.delete("1.0", "end")
+            self.insert("1.0", text)
+        else:
+            self._show_placeholder()
+
 
 class Field(tk.Frame):
     """白底描边输入容器，高度 32。"""
@@ -727,8 +1016,8 @@ class FlatButton(tk.Canvas):
         command: Optional[Callable[[], None]] = None,
         variant: str = "secondary",
         width: Optional[int] = None,
-        height: int = 32,
-        radius: int = 6,
+        height: int = CTRL_H,
+        radius: int = CTRL_RADIUS,
         font: Any = None,
         padx: int = 14,
         bg: Optional[str] = None,
@@ -736,7 +1025,6 @@ class FlatButton(tk.Canvas):
         self._text = text
         self._command = command
         self._variant = variant
-        self._height = height
         self._radius = radius
         self._font = font or Fonts.body
         self._state = "normal"
@@ -745,11 +1033,12 @@ class FlatButton(tk.Canvas):
         self._min_width = width
         self._parent_bg = bg or _widget_bg(master)
         tw = self._font.measure(text) if hasattr(self._font, "measure") else len(text) * 8
-        self._width = width or max(tw + padx * 2, 64)
+        self._height = ui_px(height)
+        self._width = width or max(tw + self._padx * 2, ui_px(64))
         super().__init__(
             master,
             width=self._width,
-            height=height,
+            height=self._height,
             highlightthickness=0,
             bd=0,
             bg=self._parent_bg,
@@ -770,10 +1059,10 @@ class FlatButton(tk.Canvas):
 
     def set_text(self, text: str) -> None:
         self._text = text
-        measure_font = Fonts.body_bold if self._variant == "primary" and Fonts.body_bold else self._font
+        measure_font = Fonts.body_bold if self._variant in ("primary", "danger") and Fonts.body_bold else self._font
         tw = measure_font.measure(text) if hasattr(measure_font, "measure") else len(text) * 8
-        self._width = self._min_width or max(tw + self._padx * 2, 64)
-        self.configure(width=self._width)
+        self._width = self._min_width or max(tw + self._padx * 2, ui_px(64))
+        self.configure(width=self._width, height=self._height)
         self._redraw()
 
     def _on_enter(self, _event: tk.Event | None = None) -> None:
@@ -788,13 +1077,23 @@ class FlatButton(tk.Canvas):
         if self._state == "normal" and self._command:
             self._command()
 
+    def set_bg(self, bg: str) -> None:
+        self._parent_bg = bg
+        self.configure(bg=bg)
+        self._redraw()
+
     def _colors(self) -> tuple[str, str, str]:
         if self._state != "normal":
             if self._variant == "primary":
                 return "#8BB8DE", "#FFFFFF", "#8BB8DE"
+            if self._variant == "danger":
+                return "#E7B2AC", "#FFFFFF", "#E7B2AC"
             return C_CARD, "#B0B0B0", C_STROKE2
         if self._variant == "primary":
             fill = C_HOVER if self._hover else C_ACCENT
+            return fill, "#FFFFFF", fill
+        if self._variant == "danger":
+            fill = "#A82418" if self._hover else C_ERR
             return fill, "#FFFFFF", fill
         fill = "#F5F5F5" if self._hover else C_CARD
         return fill, C_TEXT, C_STROKE2
@@ -802,7 +1101,7 @@ class FlatButton(tk.Canvas):
     def _redraw(self) -> None:
         self.delete("all")
         fill, fg, outline = self._colors()
-        font = Fonts.body_bold if self._variant == "primary" else self._font
+        font = Fonts.body_bold if self._variant in ("primary", "danger") and Fonts.body_bold else self._font
         rounded_rect(
             self,
             0.5,
@@ -813,7 +1112,7 @@ class FlatButton(tk.Canvas):
             fill=fill,
             outline=outline,
         )
-        self.create_text(self._width / 2, self._height / 2, text=self._text, fill=fg, font=font)
+        canvas_text(self, self._width / 2, self._height / 2, text=self._text, fill=fg, font=font)
 
 
 def _widget_bg(widget: tk.Misc) -> str:
@@ -996,10 +1295,12 @@ class NavButton(tk.Canvas):
         kind: str,
         label: str,
         command: Optional[Callable[[], None]] = None,
-        width: int = 48,
-        height: int = 56,
+        width: int = NAV_W,
+        height: int = NAV_H,
     ) -> None:
-        super().__init__(master, width=width, height=height, highlightthickness=0, bd=0, bg=C_BG, cursor="hand2")
+        width = ui_px(width)
+        height = ui_px(height)
+        super().__init__(master, width=width, height=height, highlightthickness=0, bd=0, bg=C_RAIL, cursor="hand2")
         self.kind = kind
         self.label = label
         self._command = command
@@ -1053,46 +1354,40 @@ class NavButton(tk.Canvas):
 
     def redraw(self) -> None:
         self.delete("all")
+        self.configure(bg=C_RAIL)
         color = C_ACCENT if self.active else C_TEXT2
         font = Fonts.nav_active if self.active else Fonts.nav
         if self.active:
-            rounded_rect(self, 0, 0, self._width, self._height, 6, fill=C_SEL, outline=C_SEL)
+            rounded_rect(self, 0, 0, self._width, self._height, 8, fill=C_SEL, outline=C_SEL)
+            self.create_rectangle(0, 14, 3, self._height - 14, fill=C_ACCENT, outline=C_ACCENT)
         elif self._hover:
-            rounded_rect(self, 0, 0, self._width, self._height, 6, fill="#EAEAEA", outline="#EAEAEA")
-        else:
-            self.configure(bg=C_BG)
-        icon_size = 20
-        icon_x, icon_y = (self._width - icon_size) // 2, 7
+            rounded_rect(self, 0, 0, self._width, self._height, 8, fill="#E8E9EE", outline="#E8E9EE")
         kind = self.kind if self.kind in ("link", "chat", "proxy", "about", "user", "settings") else "settings"
-        self._icon_photo = make_nav_icon(kind, color, icon_size, self)
+        self._icon_photo = make_nav_icon(kind, color, 20, self)
+        icon_size = int(self._icon_photo.width())
+        icon_x, icon_y = (self._width - icon_size) // 2, ui_px(8)
         self.create_image(icon_x, icon_y, anchor="nw", image=self._icon_photo)
-        self.create_text(self._width / 2, 42, text=self.label, fill=color, font=font)
+        canvas_text(self, self._width / 2, ui_px(44), text=self.label, fill=color, font=font)
         if self._badge > 0:
             label = "99+" if self._badge > 99 else str(self._badge)
             scale = 1.0 + 0.28 * self._pulse
-            r = 7.2 * scale
-            cx, cy = self._width - 9, 11
+            r = ui_px(7) * scale
+            cx, cy = self._width - ui_px(9), ui_px(11)
             self.create_oval(cx - r, cy - r, cx + r, cy + r, fill=C_ACCENT, outline="#FFFFFF", width=1.5)
             badge_font = Fonts.aux_bold or Fonts.help
-            self.create_text(cx, cy, text=label, fill="#FFFFFF", font=badge_font)
+            canvas_text(self, cx, cy, text=label, fill="#FFFFFF", font=badge_font)
 
 
-class AccountButton(tk.Canvas):
-    """左侧边栏底部的账号入口：未登录显示「登录」，已登录只显示头像和绿点，不显示名称。"""
+class TitleAccount(tk.Canvas):
+    """标题栏右侧账号：未登录是「登录」，已登录是绿点 +「已登录 · 名称 ▾」。"""
 
-    def __init__(
-        self,
-        master: tk.Misc,
-        command: Optional[Callable[[], None]] = None,
-        width: int = 48,
-        height: int = 56,
-    ) -> None:
-        super().__init__(master, width=width, height=height, highlightthickness=0, bd=0, bg=C_BG, cursor="hand2")
+    def __init__(self, master: tk.Misc, command: Optional[Callable[[], None]] = None, bg: str = C_TITLE) -> None:
+        super().__init__(master, width=72, height=28, highlightthickness=0, bd=0, bg=bg, cursor="hand2")
         self._command = command
+        self._bg = bg
         self._hover = False
-        self._width = width
-        self._height = height
         self._logged_in = False
+        self._name = ""
         self.bind("<Button-1>", lambda _e: self._command() if self._command else None)
         self.bind("<Enter>", lambda _e: self._set_hover(True))
         self.bind("<Leave>", lambda _e: self._set_hover(False))
@@ -1104,32 +1399,190 @@ class AccountButton(tk.Canvas):
 
     def set_state(self, logged_in: bool, name: str = "") -> None:
         self._logged_in = bool(logged_in)
+        self._name = name or ""
         self.redraw()
 
     def redraw(self) -> None:
         self.delete("all")
+        font = Fonts.help or Fonts.body
         if self._logged_in:
+            text = f"已登录 · {self._name} ▾" if self._name else "已登录 ▾"
             color = C_TEXT if self._hover else C_TEXT2
         else:
+            text = "登录"
             color = C_HOVER if self._hover else C_ACCENT
+            font = Fonts.body_bold or font
+        tw = font.measure(text) if hasattr(font, "measure") else len(text) * 8
+        width = max(72, tw + (28 if self._logged_in else 20))
+        self.configure(width=width, height=28, bg=self._bg)
         if self._hover:
-            rounded_rect(self, 0, 0, self._width, self._height, 6, fill="#EAEAEA", outline="#EAEAEA")
-        else:
-            self.configure(bg=C_BG)
-        icon_size = 20
+            rounded_rect(self, 0, 0, width, 28, 4, fill="#E8E9EE", outline="#E8E9EE")
+        x = 10
         if self._logged_in:
-            icon_x = (self._width - icon_size) // 2
-            icon_y = (self._height - icon_size) // 2
+            self.create_oval(x, 10, x + 7, 17, fill=C_OK, outline=C_OK_SOFT, width=2)
+            x += 14
+        canvas_text(self, x, 14, text=text, fill=color, font=font, anchor="w")
+
+
+class CaptionButton(tk.Canvas):
+    """标题栏最小化 / 最大化 / 关闭。关闭悬停用错误色。"""
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        kind: str,
+        command: Optional[Callable[[], None]] = None,
+        bg: str = C_TITLE,
+    ) -> None:
+        # Do not store the size on self._w. Tk keeps the widget path there
+        # (".!frame.!frame.!captionbutton"), and create_rectangle then raises
+        # "bad screen distance".
+        self._width = ui_px(46)
+        self._height = ui_px(TITLE_H)
+        super().__init__(
+            master,
+            width=self._width,
+            height=self._height,
+            highlightthickness=0,
+            bd=0,
+            bg=bg,
+            cursor="hand2",
+        )
+        self.kind = kind
+        self._command = command
+        self._bg = bg
+        self._hover = False
+        self.bind("<Enter>", lambda _e: self._set_hover(True))
+        self.bind("<Leave>", lambda _e: self._set_hover(False))
+        self.bind("<Button-1>", self._click)
+        self._draw()
+
+    def _set_hover(self, value: bool) -> None:
+        self._hover = value
+        self._draw()
+
+    def _click(self, _event: tk.Event | None = None) -> str | None:
+        if self._command:
+            self._command()
+        return "break"
+
+    def _draw(self) -> None:
+        self.delete("all")
+        if self.kind == "close" and self._hover:
+            fill, fg = C_ERR, "#FFFFFF"
+        elif self._hover:
+            fill, fg = "#E5E5E5", C_TEXT
         else:
-            icon_x, icon_y = (self._width - icon_size) // 2, 7
-        self._icon_photo = make_nav_icon("user", color, icon_size, self)
-        self.create_image(icon_x, icon_y, anchor="nw", image=self._icon_photo)
-        if self._logged_in:
-            r = 3.2
-            cx, cy = icon_x + icon_size - 1, icon_y + 2
-            self.create_oval(cx - r, cy - r, cx + r, cy + r, fill=C_OK, outline="#FFFFFF", width=1.2)
+            fill, fg = self._bg, C_TEXT
+        self.configure(bg=fill)
+        self.create_rectangle(0, 0, self._width, self._height, fill=fill, outline=fill)
+        cx, cy = self._width / 2, self._height / 2
+        if self.kind == "min":
+            self.create_line(cx - 5, cy, cx + 5, cy, fill=fg, width=1)
+        elif self.kind == "max":
+            self.create_rectangle(cx - 5, cy - 4, cx + 5, cy + 4, outline=fg, width=1)
         else:
-            self.create_text(self._width / 2, 42, text="登录", fill=color, font=Fonts.nav_active)
+            self.create_line(cx - 5, cy - 5, cx + 5, cy + 5, fill=fg, width=1)
+            self.create_line(cx + 5, cy - 5, cx - 5, cy + 5, fill=fg, width=1)
+
+
+class MenuFlyout(tk.Toplevel):
+    """白底账号 / 设置菜单。危险项用错误色。单独置顶，避免被主窗口盖住。"""
+
+    def __init__(self, master: tk.Misc, items: list[tuple[str, Optional[Callable[[], None]], bool] | str]) -> None:
+        super().__init__(master)
+        self.withdraw()
+        self.overrideredirect(True)
+        self.configure(bg=C_CARD, highlightthickness=1, highlightbackground=C_STROKE)
+        try:
+            self.transient(master)
+        except Exception:
+            pass
+        self._built = False
+        self._rows: list[tk.Label] = []
+        inner = tk.Frame(self, bg=C_CARD)
+        inner.pack(fill="both", expand=True, padx=6, pady=6)
+        for spec in items:
+            if spec == "-":
+                tk.Frame(inner, bg=C_STROKE, height=1).pack(fill="x", padx=8, pady=4)
+                continue
+            label, command, danger = spec  # type: ignore[misc]
+            fg = C_ERR if danger else C_TEXT
+            row = tk.Label(
+                inner,
+                text=label,
+                bg=C_CARD,
+                fg=fg,
+                font=Fonts.body,
+                anchor="w",
+                padx=10,
+                pady=6,
+                cursor="hand2",
+            )
+            row.pack(fill="x")
+            row.bind("<Enter>", lambda _e, r=row: r.configure(bg=C_SEL))
+            row.bind("<Leave>", lambda _e, r=row, c=fg: r.configure(bg=C_CARD, fg=c))
+            row.bind("<Button-1>", lambda _e, fn=command: self._run(fn))
+            self._rows.append(row)
+        self._built = True
+
+    def hide(self) -> None:
+        try:
+            if self.winfo_ismapped():
+                self.withdraw()
+        except tk.TclError:
+            pass
+
+    def popup(self, anchor: tk.Widget, *, above: bool = False) -> None:
+        self.update_idletasks()
+        ax = anchor.winfo_rootx()
+        ay = anchor.winfo_rooty()
+        width = max(176, self.winfo_reqwidth())
+        height = max(32, self.winfo_reqheight())
+        owner = self.master
+        try:
+            left = int(owner.winfo_rootx()) + 8
+            right_limit = int(owner.winfo_rootx()) + int(owner.winfo_width()) - width - 8
+        except tk.TclError:
+            left, right_limit = 8, ax
+        x = min(max(left, ax + anchor.winfo_width() - width), max(left, right_limit))
+        if above:
+            y = max(8, ay - height - 4)
+        else:
+            y = ay + anchor.winfo_height() + 4
+        self.geometry(f"{width}x{height}+{int(x)}+{int(y)}")
+        self.deiconify()
+        self.lift()
+
+    def _run(self, command: Optional[Callable[[], None]]) -> None:
+        self.hide()
+        if command:
+            command()
+
+
+class SpeedPill(tk.Canvas):
+    """任务顶栏的速度胶囊，浅蓝底 + 强调色字。"""
+
+    def __init__(self, master: tk.Misc) -> None:
+        super().__init__(master, width=10, height=22, highlightthickness=0, bd=0, bg=C_CARD)
+        self._text = ""
+
+    def set_text(self, text: str) -> None:
+        self._text = (text or "").strip()
+        self.delete("all")
+        if not self._text:
+            self.configure(width=1, height=22)
+            if self.winfo_ismapped():
+                self.pack_forget()
+            return
+        font = Fonts.help or Fonts.body
+        tw = font.measure(self._text) if hasattr(font, "measure") else len(self._text) * 8
+        width = tw + 16
+        self.configure(width=width, height=22, bg=C_CARD)
+        rounded_rect(self, 0, 0, width, 22, 4, fill=C_PILL, outline=C_PILL)
+        canvas_text(self, width / 2, 11, text=self._text, fill=C_ACCENT, font=font)
+        if not self.winfo_ismapped():
+            self.pack(side="left", padx=(0, 8))
 
 
 SB_W = 12
@@ -1585,7 +2038,7 @@ class ChatList(tk.Frame):
 
 THUMB_W = 128
 THUMB_H = 72
-THUMB_RADIUS = 4
+THUMB_RADIUS = 6
 VIDEO_ROW_H = 88
 CHK_SIZE = 16
 CHK_RADIUS = 3
@@ -1800,8 +2253,13 @@ class VideoRow(tk.Frame):
         texts.pack(side="left", fill="both", expand=True, padx=(10, 12))
         mid = tk.Frame(texts, bg=C_CARD)
         mid.place(relx=0, rely=0.5, relwidth=1, anchor="w")
+        title_line = tk.Frame(mid, bg=C_CARD)
+        title_line.pack(fill="x")
+        self._title_line = title_line
+        self.lbl_done = tk.Label(title_line, text="", bg=C_CARD, fg=C_OK, font=Fonts.aux, anchor="e")
+        self.lbl_done.pack(side="right")
         self.lbl_title = tk.Label(
-            mid,
+            title_line,
             text=self._title_full,
             bg=C_CARD,
             fg=C_TEXT,
@@ -1809,15 +2267,17 @@ class VideoRow(tk.Frame):
             anchor="w",
             justify="left",
         )
-        self.lbl_title.pack(fill="x")
-        self.lbl_meta = tk.Label(mid, text="", bg=C_CARD, fg=C_TEXT3, font=Fonts.aux, anchor="w")
+        self.lbl_title.pack(side="left", fill="x", expand=True)
+        self.lbl_meta = tk.Label(
+            mid, text="", bg=C_CARD, fg=C_TEXT3, font=Fonts.aux, anchor="w", justify="left", wraplength=420
+        )
         self.lbl_meta.pack(fill="x", pady=(4, 0))
         self._texts = texts
         self._mid = mid
         self._quality_pref = QUALITY_HIGHEST
         self.refresh_meta()
 
-        for w in (self, self._chk_box, self.cover, texts, mid, self.lbl_title, self.lbl_meta):
+        for w in (self, self._chk_box, self.cover, texts, mid, title_line, self.lbl_title, self.lbl_done, self.lbl_meta):
             w.bind("<Button-1>", self._click)
         mid.bind("<Configure>", self._on_texts)
         if item.thumb_bytes:
@@ -1827,18 +2287,21 @@ class VideoRow(tk.Frame):
             self._paint_cover()
 
     def _on_texts(self, event: tk.Event) -> None:
-        self.lbl_title.configure(text=elide_text(Fonts.body, self._title_full, max(1, int(event.width))))
+        badge = self.lbl_done.winfo_width() if self.item.downloaded else 0
+        width = max(1, int(event.width) - badge - (8 if badge else 0))
+        self.lbl_title.configure(text=elide_text(Fonts.body, self._title_full, width))
 
     def _meta_text(self, pref: Optional[str] = None) -> str:
-        chosen = pick_video_quality(self.item.qualities or [], pref or self._quality_pref)
-        size = chosen.size if chosen else self.item.size
-        parts = [format_bytes(size), format_date_short(self.item.date)]
-        return " · ".join(p for p in parts if p)
+        return video_row_subtitle(self.item, pref or self._quality_pref)
 
     def refresh_meta(self, pref: Optional[str] = None) -> None:
         if pref is not None:
             self._quality_pref = pref
+        self.lbl_done.configure(text="已下载" if self.item.downloaded else "")
         self.lbl_meta.configure(text=self._meta_text())
+        width = self._mid.winfo_width() if self._mid.winfo_exists() else 0
+        if width > 20:
+            self._on_texts(type("E", (), {"width": width})())
 
     def _paint_cover(self) -> None:
         bg = C_SEL if self.selected else C_CARD
@@ -1869,7 +2332,7 @@ class VideoRow(tk.Frame):
         x1 = self._tw - 4 - bw
         y1 = self._th - 4 - bh
         self.cover.create_image(x1, y1, anchor="nw", image=self._badge)
-        self.cover.create_text(x1 + bw / 2, y1 + bh / 2, text=text, fill="#FFFFFF", font=font)
+        canvas_text(self.cover, x1 + bw / 2, y1 + bh / 2, text=text, fill="#FFFFFF", font=font)
 
     def set_thumb(self, data: Optional[bytes]) -> None:
         photo = make_cover_photo(data, widget=self) if data else None
@@ -1893,7 +2356,9 @@ class VideoRow(tk.Frame):
         self.cover.configure(bg=bg)
         self._texts.configure(bg=bg)
         self._mid.configure(bg=bg)
+        self._title_line.configure(bg=bg)
         self.lbl_title.configure(bg=bg)
+        self.lbl_done.configure(bg=bg)
         self.lbl_meta.configure(bg=bg)
         self.chk.set_bg(bg)
         self.chk.set_checked(selected)
@@ -1981,31 +2446,101 @@ class VideoList(tk.Frame):
         for row in self._rows.values():
             row.refresh_meta(pref)
 
+    def refresh_download_marks(self) -> None:
+        for row in self._rows.values():
+            row.refresh_meta()
+
+
+_TASK_ICON_CACHE: dict[tuple[str, int], ImageTk.PhotoImage] = {}
+
+
+def make_task_icon(kind: str, widget: Optional[tk.Misc] = None) -> ImageTk.PhotoImage:
+    """任务行左侧的小文件标：下载中蓝、完成绿、等待琥珀、停止灰、失败红。"""
+    px = scaled_px(28, widget)
+    key = (kind, px)
+    cached = _TASK_ICON_CACHE.get(key)
+    if cached is not None:
+        return cached
+    palette = {
+        "running": ("#E8F2FC", C_ACCENT),
+        "queued": (C_ICON_MUTED, C_TEXT3),
+        "waiting": ("#F4E4B8", C_WAIT_BAR),
+        "stopped": (C_ICON_MUTED, C_TEXT3),
+        "done": (C_OK_SOFT, C_OK),
+        "error": ("#F8E6E4", C_ERR),
+    }
+    bg_hex, fg_hex = palette.get(kind, palette["queued"])
+    over = 3
+    s = px * over
+    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle((0, 0, s - 1, s - 1), radius=s // 5, fill=_hex_rgb(bg_hex) + (255,))
+    fg = _hex_rgb(fg_hex) + (255,)
+    # small film frame + play triangle
+    draw.rounded_rectangle((s * 0.22, s * 0.28, s * 0.78, s * 0.72), radius=s * 0.08, outline=fg, width=max(2, s // 18))
+    draw.polygon(
+        [(s * 0.42, s * 0.40), (s * 0.42, s * 0.60), (s * 0.62, s * 0.50)],
+        fill=fg,
+    )
+    img = img.resize((px, px), Image.Resampling.LANCZOS)
+    photo = ImageTk.PhotoImage(img)
+    _TASK_ICON_CACHE[key] = photo
+    return photo
+
 
 class TaskRow(tk.Frame):
-    def __init__(self, master: tk.Misc) -> None:
+    def __init__(
+        self,
+        master: tk.Misc,
+        on_remove: Optional[Callable[[str], None]] = None,
+        on_stop_one: Optional[Callable[[str], None]] = None,
+    ) -> None:
         super().__init__(master, bg=C_CARD)
         self.key = ""
-        top = tk.Frame(self, bg=C_CARD)
-        top.pack(fill="x", padx=12, pady=(10, 0))
+        self._on_remove = on_remove
+        self._on_stop_one = on_stop_one
+        self._bg = C_CARD
+        self._status = ""
+        self._bar_pct = 0
+        self._bar_color = C_ACCENT
+
+        rule = tk.Frame(self, bg=C_STROKE, height=1)
+        rule.pack_propagate(False)
+        rule.pack(side="bottom", fill="x")
+
+        actions = tk.Frame(self, bg=C_CARD)
+        actions.pack(side="right", padx=(8, 12))
+        self._actions = actions
+        self.btn_stop = FlatButton(actions, "暂停", command=self._stop_clicked, height=26, padx=10, font=Fonts.help, bg=C_CARD)
+        self.btn_remove = FlatButton(actions, "删除", command=self._remove_clicked, height=26, padx=10, font=Fonts.help, bg=C_CARD)
+        self.btn_remove.pack(side="right")
+
+        self.icon = tk.Label(self, bg=C_CARD)
+        self.icon.pack(side="left", padx=(12, 8), pady=10)
+
+        body = tk.Frame(self, bg=C_CARD)
+        body.pack(side="left", fill="both", expand=True, pady=(8, 8))
+        self._body = body
+
+        top = tk.Frame(body, bg=C_CARD)
+        top.pack(fill="x")
+        self._top = top
         self.lbl_name = tk.Label(top, text="", bg=C_CARD, fg=C_TEXT, font=Fonts.body, anchor="w")
         self.lbl_name.pack(side="left", fill="x", expand=True)
         self.lbl_stat = tk.Label(top, text="", bg=C_CARD, fg=C_TEXT2, font=Fonts.aux, anchor="e")
         self.lbl_stat.pack(side="right")
 
-        mid = tk.Frame(self, bg=C_CARD)
-        mid.pack(fill="x", padx=12, pady=(2, 0))
+        mid = tk.Frame(body, bg=C_CARD)
+        mid.pack(fill="x", pady=(1, 0))
+        self._mid = mid
         self.lbl_sub = tk.Label(mid, text="", bg=C_CARD, fg=C_TEXT3, font=Fonts.aux, anchor="w")
-        self.lbl_sub.pack(side="left")
+        self.lbl_sub.pack(side="left", fill="x", expand=True)
         self.lbl_pct = tk.Label(mid, text="", bg=C_CARD, fg=C_TEXT2, font=Fonts.aux, anchor="e")
         self.lbl_pct.pack(side="right")
 
-        self.bar = tk.Canvas(self, height=4, highlightthickness=0, bd=0, bg=C_CARD)
-        self.bar.pack(fill="x", padx=12, pady=(6, 11))
-        self._bar_pct = 0
-        self._bar_color = C_ACCENT
+        self.bar = tk.Canvas(body, height=6, highlightthickness=0, bd=0, bg=C_CARD)
+        self.bar.pack(fill="x", pady=(6, 0))
         self.bar.bind("<Configure>", lambda _e: self._draw_bar(self._bar_pct, self._bar_color))
-        tk.Frame(self, bg=C_STROKE, height=1).pack(fill="x")
 
     def update_row(
         self,
@@ -2016,54 +2551,98 @@ class TaskRow(tk.Frame):
         speed: float = 0.0,
         error: str = "",
     ) -> None:
-        self.lbl_name.configure(text=name, fg=C_TEXT2 if status == "done" else C_TEXT)
+        self._status = status
+        pct = int(current * 100 / total) if total else (100 if status == "done" else 0)
+        pct = max(0, min(100, pct))
+        sub = task_row_status_text(status, error, speed, total, current)
+        sub_fg = C_TEXT3
+        stat_fg = C_TEXT2
+        pct_fg = C_TEXT2
+        name_fg = C_TEXT
+        bar_color = C_ACCENT
+        row_bg = C_CARD
+        icon_kind = status if status in ("running", "queued", "waiting", "stopped", "done", "error") else "queued"
         if status == "done":
-            self.lbl_stat.configure(text="已完成", fg=C_OK)
-            self.lbl_sub.configure(text=format_bytes(total or current) if (total or current) else "")
-            self.lbl_pct.configure(text="100%", fg=C_TEXT2)
-            pct = 100
+            stat = "已完成"
+            stat_fg = pct_fg = sub_fg = C_OK
             bar_color = C_OK
+            pct = 100
         elif status == "error":
-            self.lbl_stat.configure(text="失败", fg=C_ERR)
-            self.lbl_sub.configure(text=error or "")
-            self.lbl_pct.configure(text="")
-            pct = int(current * 100 / total) if total else 0
+            stat = "失败"
+            stat_fg = sub_fg = C_ERR
             bar_color = C_ERR
-        elif status == "stopped":
-            self.lbl_stat.configure(text="已停止", fg=C_TEXT2)
-            self.lbl_sub.configure(text="")
             self.lbl_pct.configure(text="")
-            pct = int(current * 100 / total) if total else 0
-            bar_color = C_TEXT3
+        elif status == "stopped":
+            stat = f"{format_bytes(current)} / {format_bytes(total)}" if total else (format_bytes(current) if current else "")
+            bar_color = "#B0B0B0"
+            sub_fg = C_TEXT2
+        elif status == "waiting":
+            stat = f"{format_bytes(current)} / {format_bytes(total)}" if total else ""
+            sub_fg = C_WAIT
+            bar_color = C_WAIT_BAR
+            row_bg = C_WAIT_BG
         elif status == "queued":
-            size = f"{format_bytes(total)}" if total else ""
-            self.lbl_stat.configure(text=size, fg=C_TEXT2)
-            self.lbl_sub.configure(text="排队中")
-            self.lbl_pct.configure(text="0%" if not current else f"{int(current * 100 / total) if total else 0}%")
-            pct = int(current * 100 / total) if total else 0
+            stat = format_bytes(total) if total else ""
             bar_color = C_ACCENT
         else:
+            icon_kind = "running"
             if total:
-                self.lbl_stat.configure(text=f"{format_bytes(current)} / {format_bytes(total)}", fg=C_TEXT2)
-                pct = int(current * 100 / total) if total else 0
+                stat = f"{format_bytes(current)} / {format_bytes(total)}"
             else:
-                self.lbl_stat.configure(text=format_bytes(current) if current else "", fg=C_TEXT2)
-                pct = 0
-            self.lbl_sub.configure(text=format_speed(speed) if speed else "下载中")
-            self.lbl_pct.configure(text=f"{pct}%")
+                stat = format_bytes(current) if current else ""
             bar_color = C_ACCENT
+        if status == "error":
+            stat_text = stat
+            pct_text = ""
+        else:
+            stat_text = stat
+            pct_text = f"{pct}%"
+        self._apply_bg(row_bg)
+        self.lbl_name.configure(text=name, fg=name_fg)
+        self.lbl_stat.configure(text=stat_text, fg=stat_fg)
+        self.lbl_sub.configure(text=sub, fg=sub_fg)
+        self.lbl_pct.configure(text=pct_text, fg=pct_fg)
+        self.icon.configure(image=make_task_icon(icon_kind, self))
+        self._icon_ref = make_task_icon(icon_kind, self)
+        self.icon.configure(image=self._icon_ref)
+        show_stop = status in ("running", "waiting")
+        if show_stop:
+            if not geometry_managed(self.btn_stop):
+                self.btn_stop.pack(side="right", padx=(0, 6))
+        elif geometry_managed(self.btn_stop):
+            self.btn_stop.pack_forget()
         self._draw_bar(pct, bar_color)
+
+    def _apply_bg(self, bg: str) -> None:
+        self._bg = bg
+        self.configure(bg=bg)
+        for widget in (self.icon, self._body, self._top, self._mid, self.lbl_name, self.lbl_stat, self.lbl_sub, self.lbl_pct, self.bar, self._actions):
+            try:
+                widget.configure(bg=bg)
+            except tk.TclError:
+                pass
+        self.btn_stop.set_bg(bg)
+        self.btn_remove.set_bg(bg)
 
     def _draw_bar(self, pct: int, color: str) -> None:
         self._bar_pct = pct
         self._bar_color = color
         self.bar.delete("all")
         w = max(int(self.bar.winfo_width()), 1)
-        h = 4
-        self.bar.create_rectangle(0, 0, w, h, fill=C_BAR, outline=C_BAR)
+        h = 6
+        track = "#E4D7B0" if self._status == "waiting" else C_BAR
+        rounded_rect(self.bar, 0, 0, w, h, 3, fill=track, outline=track)
         fw = max(0, int(w * max(0, min(pct, 100)) / 100))
         if fw:
-            self.bar.create_rectangle(0, 0, fw, h, fill=color, outline=color)
+            rounded_rect(self.bar, 0, 0, max(fw, 6), h, 3, fill=color, outline=color)
+
+    def _remove_clicked(self) -> None:
+        if self._on_remove and self.key:
+            self._on_remove(self.key)
+
+    def _stop_clicked(self) -> None:
+        if self._on_stop_one and self.key:
+            self._on_stop_one(self.key)
 
 
 class TaskList(tk.Frame):
@@ -2073,6 +2652,8 @@ class TaskList(tk.Frame):
         on_stop: Callable[[], None],
         on_open_folder: Optional[Callable[[], None]] = None,
         on_close: Optional[Callable[[], None]] = None,
+        on_remove: Optional[Callable[[str], None]] = None,
+        on_stop_one: Optional[Callable[[str], None]] = None,
     ) -> None:
         super().__init__(
             master,
@@ -2084,6 +2665,8 @@ class TaskList(tk.Frame):
         self._on_stop = on_stop
         self._on_open_folder = on_open_folder
         self._on_close = on_close
+        self._on_remove = on_remove
+        self._on_stop_one = on_stop_one
         self._items: dict[str, dict[str, Any]] = {}
         self._order: list[str] = []
         self._rows: dict[str, TaskRow] = {}
@@ -2107,15 +2690,12 @@ class TaskList(tk.Frame):
         self._header = hd
         hd.pack(fill="x")
         hd.pack_propagate(False)
-        self.lbl_title = tk.Label(hd, text="就绪", bg=C_CARD, fg=C_TEXT, font=Fonts.help, anchor="w")
-        self.lbl_title.pack(side="left", padx=12)
+        self.lbl_title = tk.Label(hd, text="就绪", bg=C_CARD, fg=C_TEXT, font=Fonts.body_bold, anchor="w")
+        self.lbl_title.pack(side="left", padx=(12, 8))
+        self.speed_pill = SpeedPill(hd)
         self.lbl_meta = tk.Label(hd, text="", bg=C_CARD, fg=C_TEXT2, font=Fonts.help, anchor="w")
-        self.lbl_meta.pack(side="left", padx=(2, 0))
         self.btn_close = FlatButton(hd, "关闭", command=self._close, height=26, padx=10, font=Fonts.help, bg=C_CARD)
-        self.btn_stop = FlatButton(hd, "停止", command=on_stop, height=26, padx=10, font=Fonts.help, bg=C_CARD)
-        self.btn_open_folder = FlatButton(
-            hd, "打开文件夹", command=on_open_folder, height=26, padx=10, font=Fonts.help, bg=C_CARD
-        )
+        self.btn_stop = FlatButton(hd, "全部暂停", command=on_stop, height=26, padx=10, font=Fonts.help, bg=C_CARD)
         # packed when running / finished
         tk.Frame(self, bg=C_STROKE, height=1).pack(fill="x")
 
@@ -2136,9 +2716,20 @@ class TaskList(tk.Frame):
         self._show_stop(False)
         self._show_open(False)
 
-    def set_header(self, title: str, meta: str = "", show_stop: bool = False, show_open: bool = False) -> None:
+    def set_header(
+        self,
+        title: str,
+        meta: str = "",
+        show_stop: bool = False,
+        show_open: bool = False,
+        speed: str = "",
+    ) -> None:
         self.lbl_title.configure(text=title)
-        self.lbl_meta.configure(text=meta)
+        self.lbl_meta.configure(text="")
+        shown = (speed or "").strip()
+        if not shown and meta and ("/s" in meta):
+            shown = meta.replace("·", "").strip()
+        self.speed_pill.set_text(shown)
         self._show_stop(show_stop)
         self._show_open(show_open)
 
@@ -2147,7 +2738,9 @@ class TaskList(tk.Frame):
         self._pack_header_buttons()
 
     def _show_open(self, show: bool) -> None:
-        self._open_wanted = bool(show and self._on_open_folder)
+        # 「打开文件夹」只留在窗口顶部「浏览」旁边。任务头不再放一颗。
+        _ = show
+        self._open_wanted = False
         self._pack_header_buttons()
 
     def _show_close(self, show: bool) -> None:
@@ -2155,14 +2748,12 @@ class TaskList(tk.Frame):
         self._pack_header_buttons()
 
     def _pack_header_buttons(self) -> None:
-        for btn in (self.btn_close, self.btn_open_folder, self.btn_stop):
-            if btn.winfo_ismapped():
+        for btn in (self.btn_close, self.btn_stop):
+            if geometry_managed(btn):
                 btn.pack_forget()
         # pack right-to-left: close is rightmost
         if self._closable:
             self.btn_close.pack(side="right", padx=(0, 12))
-        if getattr(self, "_open_wanted", False):
-            self.btn_open_folder.pack(side="right", padx=(0, 8))
         if getattr(self, "_stop_wanted", False):
             self.btn_stop.pack(side="right", padx=(0, 8))
 
@@ -2236,7 +2827,7 @@ class TaskList(tk.Frame):
         self._show_empty(False)
         row = self._rows.get(key)
         if row is None:
-            row = TaskRow(self.scroll.inner)
+            row = TaskRow(self.scroll.inner, on_remove=self._on_remove, on_stop_one=self._on_stop_one)
             row.key = key
             self._rows[key] = row
             self._repack()
@@ -2271,6 +2862,13 @@ class TaskList(tk.Frame):
         total = len(self._order)
         return done, running, total
 
+    def summary(self) -> dict[str, int]:
+        counts = {"running": 0, "waiting": 0, "stopped": 0, "queued": 0, "done": 0, "error": 0}
+        for item in self._items.values():
+            status = str(item.get("status") or "")
+            counts[status] = counts.get(status, 0) + 1
+        return counts
+
     def current_speed(self) -> float:
         for item in self._items.values():
             if item["status"] == "running":
@@ -2295,8 +2893,8 @@ class TaskList(tk.Frame):
 CHAT_FILTERS = ("全部", "频道", "群组", "私聊", "机器人")
 
 
-class FilterChipBar(tk.Frame):
-    """28px text tabs: selected = accent + bold + light pill; others are plain text."""
+class FilterChipBar(tk.Canvas):
+    """Win11 segmented filter: light track, white chip on the selected item."""
 
     def __init__(
         self,
@@ -2304,20 +2902,12 @@ class FilterChipBar(tk.Frame):
         command: Optional[Callable[[str], None]] = None,
         bg: str = C_BG,
     ) -> None:
-        super().__init__(master, bg=bg, height=28)
-        self.grid_propagate(False)
+        super().__init__(master, height=28, highlightthickness=0, bd=0, bg=bg, cursor="hand2")
         self._command = command
         self.value = "全部"
-        self._bg = bg
-        self._chips: dict[str, tk.Canvas] = {}
-        for i, label in enumerate(CHAT_FILTERS):
-            self.columnconfigure(i, weight=1, uniform="filt")
-            self.rowconfigure(0, weight=1)
-            chip = tk.Canvas(self, height=22, highlightthickness=0, bd=0, bg=bg, cursor="hand2")
-            chip.grid(row=0, column=i, padx=0, pady=3, sticky="nsew")
-            chip.bind("<Button-1>", lambda _e, v=label: self._pick(v))
-            chip.bind("<Configure>", lambda _e, v=label: self._draw_one(v))
-            self._chips[label] = chip
+        self._outer = bg
+        self.bind("<Configure>", lambda _e: self._redraw())
+        self.bind("<Button-1>", self._on_click)
         self._redraw()
 
     def set_value(self, value: str) -> None:
@@ -2333,25 +2923,29 @@ class FilterChipBar(tk.Frame):
         if self._command:
             self._command(value)
 
-    def _redraw(self) -> None:
-        for label in self._chips:
-            self._draw_one(label)
+    def _on_click(self, event: tk.Event) -> None:
+        width = max(1, int(self.winfo_width()))
+        slot = width / len(CHAT_FILTERS)
+        index = min(len(CHAT_FILTERS) - 1, max(0, int(event.x / slot)))
+        self._pick(CHAT_FILTERS[index])
 
-    def _draw_one(self, label: str) -> None:
-        chip = self._chips.get(label)
-        if chip is None:
-            return
-        active = label == self.value
-        width = max(8, int(chip.winfo_width()))
-        height = max(22, int(chip.winfo_height()) if chip.winfo_height() > 1 else 22)
-        chip.delete("all")
-        chip.configure(bg=self._bg)
-        if active:
-            rounded_rect(chip, 0.5, 0.5, width - 0.5, height - 0.5, height / 2, fill=C_SEL, outline=C_SEL)
-            fg, font = C_ACCENT, Fonts.aux_bold or Fonts.nav_active
-        else:
-            fg, font = C_TEXT2, Fonts.aux
-        chip.create_text(width / 2, height / 2, text=label, fill=fg, font=font)
+    def _redraw(self) -> None:
+        self.delete("all")
+        width = max(8, int(self.winfo_width()) if self.winfo_width() > 1 else 220)
+        height = 28
+        self.configure(bg=self._outer, height=height)
+        rounded_rect(self, 0, 0, width, height, 6, fill=C_FILTER_TRACK, outline=C_FILTER_TRACK)
+        slot = width / len(CHAT_FILTERS)
+        for i, label in enumerate(CHAT_FILTERS):
+            x1 = i * slot + 2
+            x2 = (i + 1) * slot - 2
+            active = label == self.value
+            if active:
+                rounded_rect(self, x1, 2, x2, height - 2, 4, fill="#FFFFFF", outline="#FFFFFF")
+                fg, font = C_TEXT, Fonts.aux_bold or Fonts.nav_active
+            else:
+                fg, font = C_TEXT2, Fonts.aux
+            canvas_text(self, (x1 + x2) / 2, height / 2, text=label, fill=fg, font=font)
 
 
 class QualityPicker(tk.Frame):
@@ -2425,7 +3019,7 @@ class QualityPicker(tk.Frame):
         self._box.configure(width=width, height=24, bg=self._bg)
         self._box.delete("all")
         rounded_rect(self._box, 0.5, 0.5, width - 0.5, 23.5, 4, fill=C_CARD, outline=C_STROKE2)
-        self._box.create_text(width / 2, 12, text=label, fill=C_TEXT, font=font)
+        canvas_text(self._box, width / 2, 12, text=label, fill=C_TEXT, font=font)
 
     def _open_menu(self, _event: Optional[tk.Event] = None) -> None:
         if self._mode != "dropdown":
@@ -2460,12 +3054,23 @@ class ModalDialog(tk.Toplevel):
         self._width = width
         self.resizable(False, False)
         self.title(title)
-        self.configure(bg=C_CARD)
+        self.configure(bg=C_CARD, highlightthickness=1, highlightbackground=C_STROKE)
         try:
             self.transient(master)
         except Exception:
             pass
+        try:
+            self.overrideredirect(True)
+        except tk.TclError:
+            pass
         apply_window_icon(self, getattr(master, "_icon_photos", []))
+
+        hd = tk.Frame(self, bg=C_CARD, height=TITLE_H)
+        hd.pack(fill="x")
+        hd.pack_propagate(False)
+        tk.Label(hd, text=title, bg=C_CARD, fg=C_TEXT, font=Fonts.title, anchor="w").pack(side="left", padx=16)
+        CaptionButton(hd, "close", self.hide, bg=C_CARD).pack(side="right")
+        tk.Frame(self, bg=C_STROKE, height=1).pack(fill="x")
 
         self.body = tk.Frame(self, bg=C_CARD, width=width)
         self.body.pack(fill="both", expand=True, padx=16, pady=(16, 18))
@@ -2491,15 +3096,18 @@ class ModalDialog(tk.Toplevel):
             owner.update_idletasks()
         except Exception:
             pass
-        self.deiconify()
         self.update_idletasks()
-        req_h = max(self.winfo_reqheight(), 120)
+        req_h = max(self.winfo_reqheight(), 160)
         try:
             x = owner.winfo_rootx() + max(0, (owner.winfo_width() - self._width) // 2)
             y = owner.winfo_rooty() + max(0, (owner.winfo_height() - req_h) // 2)
         except Exception:
             x, y = 120, 120
-        self.geometry(f"{self._width}x{req_h}+{x}+{y}")
+        geo = f"{self._width}x{req_h}+{int(x)}+{int(y)}"
+        self.geometry(geo)
+        self.deiconify()
+        self.update_idletasks()
+        self.geometry(geo)
         self.lift()
         try:
             self.grab_set()
@@ -2524,11 +3132,15 @@ class ModalDialog(tk.Toplevel):
 
 class App(tk.Tk):
     def __init__(self) -> None:
+        enable_windows_dpi_awareness()
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("880x640")
-        self.minsize(760, 560)
+        self.geometry(f"{WINDOW_W}x{WINDOW_H}")
+        self.minsize(WINDOW_MIN_W, WINDOW_MIN_H)
         self.configure(bg=C_BG)
+        self._borderless = False
+        self._zoomed = False
+        self._zoom_restore = ""
         self._icon_photos: list = []
         self._tray = None
         self._tray_hint_shown = False
@@ -2546,6 +3158,10 @@ class App(tk.Tk):
         self._busy = False
         self._fly_chip: Optional[tk.Canvas] = None
         self._fly_after: Optional[str] = None
+        self._queued_chat_batches: list[tuple[Any, list[Any], Path, int]] = []
+        self._preserved_queue_keys: set[str] = set()
+        self._queue_mutate_lock = threading.Lock()
+        self._want_borderless_on_restore = False
         self._stop_flag = threading.Event()
         self._dialogs: list[DialogItem] = []
         self._selected_dialog: Optional[DialogItem] = None
@@ -2554,7 +3170,10 @@ class App(tk.Tk):
         self._video_gen = 0
         self._video_loading = False
         self._video_has_more = False
-        self._video_offset_id = 0
+        self._video_scan = VideoScanState()
+        self._video_notices: list[str] = []
+        self._task_gen = 0
+        self.queue = DownloadQueue(persist_path=QUEUE_PATH)
         self._phone_pending: Optional[str] = None
         self._awaiting_password = False
         self._logged_in = False
@@ -2568,10 +3187,14 @@ class App(tk.Tk):
         self.var_quality = tk.StringVar(value=quality_pref_label(self.cfg.get("video_quality")))
 
         Fonts.init(self)
+        self._apply_dpi_window()
         self._build_style()
         self._build_ui()
+        self._restore_unfinished_downloads()
         self._build_login_dialogs()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.bind_all("<Button-1>", self._maybe_hide_flyouts, add="+")
+        self.after_idle(self._apply_borderless)
         self.after(80, self._drain_ui_queue)
         self.after(120, self._bootstrap)
         self.after(200, self._start_tray)
@@ -2584,6 +3207,8 @@ class App(tk.Tk):
             pass
         self.configure(bg=C_BG)
         style = ttk.Style(self)
+        apply_tk_dpi_scaling(self)
+        apply_ui_font_defaults(self)
         style.configure(".", font=Fonts.body)
         style.configure("TRadiobutton", font=Fonts.body, background=C_CARD, foreground=C_TEXT)
         style.map("TRadiobutton", background=[("selected", C_CARD), ("active", C_CARD)])
@@ -2592,71 +3217,290 @@ class App(tk.Tk):
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
 
-        self.menu_account = tk.Menu(self, tearoff=0, font=Fonts.body)
-        self.menu_account.add_command(label="切换账号", command=self._switch_account)
-        self.menu_account.add_command(label="退出登录", command=self._logout)
+        self.account_flyout = MenuFlyout(
+            self,
+            [
+                ("代理", self._open_proxy, False),
+                ("切换账号", self._switch_account, False),
+                "-",
+                ("退出登录", self._logout, True),
+            ],
+        )
+        self.settings_flyout = MenuFlyout(
+            self,
+            [
+                ("代理", self._open_proxy, False),
+                ("关于", self._open_about, False),
+            ],
+        )
+
+        self._build_titlebar()
 
         body = tk.Frame(self, bg=C_BG)
-        body.grid(row=0, column=0, sticky="nsew")
+        body.grid(row=1, column=0, sticky="nsew")
         body.columnconfigure(1, weight=1)
         body.rowconfigure(0, weight=1)
 
         self._build_rail(body)
         self._build_main(body)
+        self._build_resize_grips()
+
+    def _build_titlebar(self) -> None:
+        bar = tk.Frame(self, bg=C_TITLE, height=ui_px(TITLE_H))
+        self.titlebar = bar
+        bar.grid(row=0, column=0, sticky="ew")
+        bar.grid_propagate(False)
+        bar.columnconfigure(2, weight=1)
+
+        icon = self._load_title_icon()
+        self.lbl_title_icon = tk.Label(bar, image=icon, bg=C_TITLE) if icon is not None else tk.Label(bar, bg=C_TITLE)
+        self.lbl_title_icon.pack(side="left", padx=(14, 0))
+        self.lbl_title_name = tk.Label(bar, text=APP_NAME, bg=C_TITLE, fg=C_TEXT, font=Fonts.titlebar)
+        self.lbl_title_name.pack(side="left", padx=(8, 0))
+
+        caps = tk.Frame(bar, bg=C_TITLE)
+        caps.pack(side="right", fill="y")
+        CaptionButton(caps, "close", self._on_close, bg=C_TITLE).pack(side="right")
+        CaptionButton(caps, "max", self._toggle_zoom, bg=C_TITLE).pack(side="right")
+        CaptionButton(caps, "min", self._minimize, bg=C_TITLE).pack(side="right")
+
+        self.title_account = TitleAccount(bar, command=self._on_account_click, bg=C_TITLE)
+        self.title_account.pack(side="right", padx=(0, 8))
+        self._refresh_account_bar()
+
+        for widget in (bar, self.lbl_title_icon, self.lbl_title_name):
+            widget.bind("<Button-1>", self._title_drag_start)
+            widget.bind("<B1-Motion>", self._title_drag_move)
+            widget.bind("<Double-Button-1>", self._toggle_zoom)
+        tk.Frame(self, bg=C_STROKE, height=1).grid(row=0, column=0, sticky="sew")
+
+    def _load_title_icon(self) -> Optional[ImageTk.PhotoImage]:
+        png = resource_path("app-icon-64.png", "app-icon-256.png", "app-icon.ico")
+        if png is None:
+            return None
+        try:
+            img = Image.open(png).convert("RGBA").resize((18, 18), Image.Resampling.LANCZOS)
+            mask = Image.new("L", (18, 18), 0)
+            ImageDraw.Draw(mask).rounded_rectangle((0, 0, 17, 17), radius=4, fill=255)
+            img.putalpha(mask)
+            self._title_icon_img = ImageTk.PhotoImage(img)
+            return self._title_icon_img
+        except Exception:
+            return None
 
     def _refresh_account_bar(self) -> None:
-        if getattr(self, "nav_account", None) is not None:
-            self.nav_account.set_state(self._logged_in, self._account_name)
+        if getattr(self, "title_account", None) is not None:
+            self.title_account.set_state(self._logged_in, self._account_name)
 
     def _on_account_click(self) -> None:
         if self._logged_in:
-            self._popup(self.menu_account, self.nav_account)
+            if self.account_flyout.winfo_ismapped():
+                self.account_flyout.hide()
+            else:
+                self.settings_flyout.hide()
+                self.account_flyout.popup(self.title_account)
         else:
             self._open_login()
 
-    def _popup(self, menu: tk.Menu, anchor: tk.Widget) -> None:
+    def _on_settings_click(self) -> None:
+        if self.settings_flyout.winfo_ismapped():
+            self.settings_flyout.hide()
+        else:
+            self.account_flyout.hide()
+            self.settings_flyout.popup(self.nav_settings, above=True)
+
+    def _widget_is_under(self, widget: tk.Misc | None, parent: tk.Misc) -> bool:
+        while widget is not None:
+            if widget is parent:
+                return True
+            widget = getattr(widget, "master", None)
+        return False
+
+    def _maybe_hide_flyouts(self, event: tk.Event) -> None:
+        widget = event.widget
+        if not self._widget_is_under(widget, self.account_flyout) and widget is not getattr(self, "title_account", None):
+            self.account_flyout.hide()
+        settings = getattr(self, "nav_settings", None)
+        if not self._widget_is_under(widget, self.settings_flyout) and widget is not settings:
+            self.settings_flyout.hide()
+
+    def _title_drag_start(self, event: tk.Event) -> None:
+        self._drag_dx = event.x_root - self.winfo_x()
+        self._drag_dy = event.y_root - self.winfo_y()
+
+    def _title_drag_move(self, event: tk.Event) -> None:
+        if getattr(self, "_zoomed", False):
+            return
+        self.geometry(f"+{event.x_root - self._drag_dx}+{event.y_root - self._drag_dy}")
+
+    def _toggle_zoom(self, _event: tk.Event | None = None) -> None:
+        if self._zoomed:
+            if self._zoom_restore:
+                self.geometry(self._zoom_restore)
+            self._zoomed = False
+            return
+        self._zoom_restore = self.geometry()
+        self.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight()}+0+0")
+        self._zoomed = True
+
+    def _minimize(self) -> None:
+        """Normal taskbar minimize. Close (X) is what hides to the tray."""
+        if chrome_action("minimize") != "taskbar":
+            return
+        self._want_borderless_on_restore = bool(getattr(self, "_borderless", False))
         try:
-            x = anchor.winfo_rootx()
-            y_below = anchor.winfo_rooty() + anchor.winfo_height()
+            if self._borderless:
+                # overrideredirect windows often have no taskbar button and
+                # ignore iconify. Drop the client frame, then minimize.
+                self.overrideredirect(False)
+                self.update_idletasks()
+                if sys.platform == "win32":
+                    self._win_taskbar_and_mica()
+            self.iconify()
+        except tk.TclError:
+            self._want_borderless_on_restore = False
+
+    def _restore_borderless_chrome(self) -> None:
+        if not getattr(self, "_want_borderless_on_restore", False):
+            return
+        if getattr(self, "_exiting", False) or getattr(self, "_hiding_to_tray", False):
+            return
+        try:
+            if str(self.state()) == "iconic":
+                return
+        except tk.TclError:
+            return
+        self._want_borderless_on_restore = False
+        geo = self.geometry()
+        try:
+            self.overrideredirect(True)
+            self._borderless = True
+            self.geometry(geo)
+            if sys.platform == "win32":
+                self._win_taskbar_and_mica()
+        except tk.TclError:
+            self._borderless = False
+
+    def _apply_borderless(self) -> None:
+        try:
+            self.update_idletasks()
+            geo = self.geometry()
+            self.overrideredirect(True)
+            if "+" not in geo:
+                geo = f"{WINDOW_W}x{WINDOW_H}+80+40"
+            self.geometry(geo)
+            self._borderless = True
+        except tk.TclError:
+            self._borderless = False
+            return
+        if sys.platform == "win32":
+            self._win_taskbar_and_mica()
+
+    def _toplevel_hwnd(self) -> int:
+        self.update_idletasks()
+        child = int(self.winfo_id())
+        if sys.platform != "win32":
+            return child
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.GetAncestor.restype = wintypes.HWND
+        root = user32.GetAncestor(child, 2)
+        return int(root or child)
+
+    def _win_taskbar_and_mica(self) -> None:
+        if sys.platform != "win32":
+            return
+        import ctypes
+        from ctypes import wintypes
+
+        try:
+            hwnd = self._toplevel_hwnd()
+            user32 = ctypes.windll.user32
+            GWL_EXSTYLE = -20
+            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            style = (style & ~0x00000080) | 0x00040000
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+            dwm = ctypes.windll.dwmapi
+            corner = ctypes.c_int(2)
+            dwm.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(corner), ctypes.sizeof(corner))
+            backdrop = ctypes.c_int(2)
+            dwm.DwmSetWindowAttribute(hwnd, 38, ctypes.byref(backdrop), ctypes.sizeof(backdrop))
+            # COLORREF is 0x00BBGGRR for #F9FAFD
+            caption = ctypes.c_int(0x00FDFAF9)
+            dwm.DwmSetWindowAttribute(hwnd, 35, ctypes.byref(caption), ctypes.sizeof(caption))
+        except Exception:
+            pass
+
+    def _build_resize_grips(self) -> None:
+        def bind(widget: tk.Widget, edge: str, cursor: str) -> None:
+            widget.configure(cursor=cursor)
+            widget.bind("<Button-1>", lambda e, edge=edge: self._grip_down(e, edge))
+            widget.bind("<B1-Motion>", self._grip_drag)
+
+        south = tk.Frame(self, bg=C_BG, height=6, cursor="sb_v_double_arrow")
+        south.grid(row=2, column=0, sticky="ew")
+        bind(south, "s", "sb_v_double_arrow")
+        east = tk.Frame(self, bg=C_BG, width=6, cursor="sb_h_double_arrow")
+        east.place(relx=1, rely=0, relheight=1, anchor="ne")
+        bind(east, "e", "sb_h_double_arrow")
+        corner = tk.Frame(self, bg=C_BG, width=12, height=12)
+        corner.place(relx=1, rely=1, anchor="se")
+        for cursor in ("size_nw_se", "bottom_right_corner", "sizing"):
             try:
-                end = menu.index("end")
-                count = 0 if end is None else int(end) + 1
-            except Exception:
-                count = 2
-            est = count * 28 + 16
-            screen_h = anchor.winfo_screenheight()
-            if y_below + est > screen_h - 12:
-                y = max(8, anchor.winfo_rooty() - est)
-            else:
-                y = y_below
-            menu.tk_popup(x, y)
-        finally:
-            menu.grab_release()
+                corner.configure(cursor=cursor)
+                break
+            except tk.TclError:
+                continue
+        bind(corner, "se", str(corner.cget("cursor") or "arrow"))
+
+    def _grip_down(self, event: tk.Event, edge: str) -> None:
+        self._grip_edge = edge
+        self._grip_x = event.x_root
+        self._grip_y = event.y_root
+        self._grip_geo = (self.winfo_x(), self.winfo_y(), self.winfo_width(), self.winfo_height())
+
+    def _grip_drag(self, event: tk.Event) -> None:
+        edge = getattr(self, "_grip_edge", "")
+        if not edge or self._zoomed:
+            return
+        x, y, w, h = self._grip_geo
+        dx = event.x_root - self._grip_x
+        dy = event.y_root - self._grip_y
+        nx, ny, nw, nh = x, y, w, h
+        if "e" in edge:
+            nw = max(WINDOW_MIN_W, w + dx)
+        if "s" in edge:
+            nh = max(WINDOW_MIN_H, h + dy)
+        if "w" in edge:
+            nw = max(WINDOW_MIN_W, w - dx)
+            nx = x + (w - nw)
+        if "n" in edge:
+            nh = max(WINDOW_MIN_H, h - dy)
+            ny = y + (h - nh)
+        self.geometry(f"{int(nw)}x{int(nh)}+{int(nx)}+{int(ny)}")
 
     def _build_rail(self, body: tk.Frame) -> None:
-        rail = tk.Frame(body, bg=C_BG, width=64)
+        rail = tk.Frame(body, bg=C_RAIL, width=ui_px(RAIL_W))
         rail.grid(row=0, column=0, sticky="nsw")
         rail.grid_propagate(False)
         tk.Frame(body, bg=C_STROKE, width=1).grid(row=0, column=0, sticky="nse")
 
-        top = tk.Frame(rail, bg=C_BG)
+        top = tk.Frame(rail, bg=C_RAIL)
         top.pack(fill="x", padx=8, pady=(10, 0))
         self.nav_links = NavButton(top, "link", "链接", command=lambda: self._show_page("links"))
         self.nav_links.pack(pady=(0, 4))
         self.nav_chats = NavButton(top, "chat", "对话", command=lambda: self._show_page("chats"))
         self.nav_chats.pack()
 
-        bot = tk.Frame(rail, bg=C_BG)
+        bot = tk.Frame(rail, bg=C_RAIL)
         bot.pack(side="bottom", fill="x", padx=8, pady=(0, 12))
-        self.nav_proxy = NavButton(bot, "proxy", "代理", command=self._open_proxy)
-        self.nav_proxy.pack(pady=(0, 4))
-        self.nav_about = NavButton(bot, "about", "关于", command=self._open_about)
-        self.nav_about.pack(pady=(0, 4))
-        self.nav_account = AccountButton(bot, command=self._on_account_click)
-        self.nav_account.pack()
-        self._refresh_account_bar()
+        self.nav_settings = NavButton(bot, "settings", "设置", command=self._on_settings_click)
+        self.nav_settings.pack()
 
     def _build_main(self, body: tk.Frame) -> None:
         self.main = tk.Frame(body, bg=C_BG)
@@ -2697,7 +3541,13 @@ class App(tk.Tk):
         self._build_link_page()
         self._build_chat_page()
 
-        self.tasks = TaskList(self.main, on_stop=self._request_stop, on_open_folder=self._open_folder)
+        self.tasks = TaskList(
+            self.main,
+            on_stop=self._request_stop,
+            on_open_folder=self._open_folder,
+            on_remove=self._on_remove_task,
+            on_stop_one=self._on_stop_one,
+        )
         self.tasks.grid(row=2, column=0, sticky="nsew", padx=16, pady=(10, 0))
         self.main.rowconfigure(2, weight=1)
 
@@ -2705,7 +3555,7 @@ class App(tk.Tk):
         foot.grid(row=3, column=0, sticky="ew", padx=16, pady=(10, 12))
         foot.columnconfigure(1, weight=1)
         self.lbl_ready = tk.Label(foot, text="就绪", bg=C_BG, fg=C_TEXT2, font=Fonts.help)
-        self.btn_log = tk.Label(foot, text="▸  日志", bg=C_BG, fg=C_TEXT2, font=Fonts.help, cursor="hand2")
+        self.btn_log = tk.Label(foot, text="▸ 日志", bg=C_BG, fg=C_TEXT2, font=Fonts.help, cursor="hand2")
         self.btn_log.pack(side="left")
         self.btn_log.bind("<Button-1>", lambda _e: self._toggle_log())
         self.btn_clear_log = tk.Label(foot, text="清空", bg=C_BG, fg=C_ACCENT, font=Fonts.help, cursor="hand2")
@@ -2762,10 +3612,10 @@ class App(tk.Tk):
         self.txt_links.pack(fill="both", expand=True)
         actions = tk.Frame(f, bg=C_BG)
         actions.grid(row=1, column=0, sticky="ew", pady=(10, 0))
-        self.quality_links = QualityPicker(actions, self.var_quality, on_change=self._on_quality_change, bg=C_BG)
-        self.quality_links.pack(side="left")
         self.btn_dl_link = FlatButton(actions, "开始下载", command=self._on_download_link, variant="primary", bg=C_BG)
         self.btn_dl_link.pack(side="right")
+        self.quality_links = QualityPicker(actions, self.var_quality, on_change=self._on_quality_change, bg=C_BG)
+        self.quality_links.pack(side="right", padx=(0, 8))
 
     def _build_chat_page(self) -> None:
         f = tk.Frame(self.page_host, bg=C_BG)
@@ -2840,30 +3690,37 @@ class App(tk.Tk):
         self.video_body.columnconfigure(0, weight=1)
         self.video_body.rowconfigure(0, weight=1)
 
+        self.video_empty = tk.Frame(self.video_body, bg=C_CARD)
+        self._empty_icon = tk.Canvas(self.video_empty, width=40, height=40, highlightthickness=0, bd=0, bg=C_CARD)
+        self._empty_icon.pack()
+        rounded_rect(self._empty_icon, 0, 0, 40, 40, 12, fill="#F3F4F6", outline="#F3F4F6")
+        self._empty_glyph = make_nav_icon("chat", C_TEXT3, 18, self._empty_icon)
+        self._empty_icon.create_image(20, 20, image=self._empty_glyph)
         self.lbl_video_empty = tk.Label(
-            self.video_body,
+            self.video_empty,
             text="选择一个对话，查看可下载的视频",
             bg=C_CARD,
             fg=C_TEXT3,
             font=Fonts.body,
         )
-        self.lbl_video_empty.place(relx=0.5, rely=0.5, anchor="center")
+        self.lbl_video_empty.pack(pady=(10, 0))
+        self.video_empty.place(relx=0.5, rely=0.5, anchor="center")
 
         self.video_list = VideoList(self.video_body, on_toggle=lambda _item: self._sync_chat_actions())
 
-        foot = tk.Frame(right, bg=C_CARD, height=44)
+        foot = tk.Frame(right, bg=C_FOOT, height=44)
         self.video_footer = foot
         foot.grid_propagate(False)
         tk.Frame(foot, bg=C_STROKE, height=1).pack(fill="x")
-        bar = tk.Frame(foot, bg=C_CARD)
+        bar = tk.Frame(foot, bg=C_FOOT)
         bar.pack(fill="both", expand=True, padx=12, pady=5)
-        self.btn_load_more = FlatButton(bar, "加载更多", command=self._on_load_more, bg=C_CARD)
+        self.btn_load_more = FlatButton(bar, "加载更多", command=self._on_load_more, bg=C_FOOT)
         self.btn_load_more.pack(side="left")
         self.btn_dl_selected = FlatButton(
-            bar, "下载选中", command=self._on_download_selected, variant="primary", bg=C_CARD
+            bar, "下载选中", command=self._on_download_selected, variant="primary", bg=C_FOOT
         )
         self.btn_dl_selected.pack(side="right")
-        self.lbl_picked = tk.Label(bar, text="已选 0", bg=C_CARD, fg=C_TEXT2, font=Fonts.help)
+        self.lbl_picked = tk.Label(bar, text="已选 0", bg=C_FOOT, fg=C_TEXT2, font=Fonts.help)
         self.lbl_picked.pack(side="right", padx=(0, 10))
         self._sync_quality_options()
 
@@ -2871,10 +3728,10 @@ class App(tk.Tk):
         if self.video_list.winfo_ismapped():
             self.video_list.pack_forget()
         self.lbl_video_empty.configure(text=text)
-        self.lbl_video_empty.place(relx=0.5, rely=0.5, anchor="center")
+        self.video_empty.place(relx=0.5, rely=0.5, anchor="center")
 
     def _show_video_list(self) -> None:
-        self.lbl_video_empty.place_forget()
+        self.video_empty.place_forget()
         if not self.video_list.winfo_ismapped():
             self.video_list.pack(fill="both", expand=True)
 
@@ -2884,7 +3741,8 @@ class App(tk.Tk):
         self._video_items = []
         self._video_loading = False
         self._video_has_more = False
-        self._video_offset_id = 0
+        self._video_scan = VideoScanState()
+        self._video_notices = []
         self.video_list.clear()
         if self.video_header.winfo_ismapped():
             self.video_header.grid_forget()
@@ -2904,7 +3762,8 @@ class App(tk.Tk):
             return
         has_items = bool(self._video_items)
         selected_n = len(self.video_list.selected_ids) if has_items else 0
-        can_act = bool(self._logged_in and not self._busy)
+        can_fetch = bool(self._logged_in and not self._busy)
+        can_download = bool(self._logged_in and selected_n)
         if has_items and selected_n == len(self._video_items):
             self.chk_select_all.set_state("on")
         elif selected_n:
@@ -2913,13 +3772,17 @@ class App(tk.Tk):
             self.chk_select_all.set_state("off")
         self.chk_select_all.set_enabled(has_items)
         if self._video_chat is not None and not (self._video_loading and not has_items):
-            self.lbl_video_count.configure(text=f"{len(self._video_items)} 个视频")
+            note_n = len(getattr(self, "_video_notices", []) or [])
+            text = f"{len(self._video_items)} 个视频"
+            if note_n:
+                text += f" · {note_n} 条说明"
+            self.lbl_video_count.configure(text=text)
         else:
             self.lbl_video_count.configure(text="")
-        more_ok = can_act and self._video_chat is not None and self._video_has_more and not self._video_loading
+        more_ok = can_fetch and self._video_chat is not None and self._video_has_more and not self._video_loading
         self.btn_load_more.set_state("normal" if more_ok else "disabled")
         self.lbl_picked.configure(text=f"已选 {selected_n}")
-        self.btn_dl_selected.set_state("normal" if can_act and selected_n else "disabled")
+        self.btn_dl_selected.set_state("normal" if can_download else "disabled")
 
     def _toggle_select_all(self) -> None:
         if not self._video_items:
@@ -2979,7 +3842,7 @@ class App(tk.Tk):
 
     def _relayout_tasks(self) -> None:
         on_links = self._page == "links"
-        # 任务列表只出现在「链接」页；对话里用飞向图标的动画提示去那里查看
+        # 任务列表只出现在「链接」页。对话里只亮侧栏角标，不在视频列表上盖浮层。
         self.main.rowconfigure(1, weight=0 if on_links else 1)
         if on_links:
             self.tasks.set_pane_mode(compact=False, closable=False)
@@ -3008,14 +3871,6 @@ class App(tk.Tk):
             count = 1
         self.nav_links.set_badge(count)
 
-    def _widget_center(self, widget: tk.Misc) -> tuple[float, float]:
-        self.update_idletasks()
-        rx, ry = self.winfo_rootx(), self.winfo_rooty()
-        return (
-            widget.winfo_rootx() - rx + widget.winfo_width() / 2,
-            widget.winfo_rooty() - ry + widget.winfo_height() / 2,
-        )
-
     def _cancel_task_fly(self) -> None:
         if self._fly_after:
             try:
@@ -3023,79 +3878,45 @@ class App(tk.Tk):
             except Exception:
                 pass
             self._fly_after = None
-        if self._fly_chip is not None:
+        chip = self._fly_chip
+        self._fly_chip = None
+        if chip is not None:
             try:
-                self._fly_chip.destroy()
+                chip.destroy()
             except Exception:
                 pass
-            self._fly_chip = None
 
     def _fly_task_to_links(self, count: int) -> None:
-        """对话里点「下载选中」后，一小块任务卡片飞向左侧「链接」图标。"""
+        """Mark new tasks on the links rail. Do not cover the chat video list.
+
+        The old hint placed a 「N 个任务」 canvas on the root, then called
+        ``lift()``. On a Canvas that method is ``tag_raise`` and throws when
+        called with no item id, so the animation never started and the chip
+        was never destroyed. It stayed on top of the video rows and, at the
+        same screen position, on the links page, and took the clicks. The rail
+        badge does not overlap the list.
+        """
         self._cancel_task_fly()
-        try:
-            sx, sy = self._widget_center(self.btn_dl_selected)
-            ex, ey = self._widget_center(self.nav_links)
-        except Exception:
-            self._refresh_links_badge()
-            self.nav_links.pulse_badge()
+        if count <= 0:
             return
-        # 飞向图标中心，略偏上，对准链结图标而不是文字
-        ey = ey - 8
-        text = f"{count} 个任务" if count > 1 else "1 个任务"
-        base_w, base_h = 102, 30
-        chip = tk.Canvas(self, width=base_w, height=base_h, highlightthickness=0, bd=0, bg=C_BG)
-        self._fly_chip = chip
-
-        def paint(scale: float) -> tuple[int, int]:
-            w = max(16, int(base_w * scale))
-            h = max(12, int(base_h * scale))
-            chip.configure(width=w, height=h)
-            chip.delete("all")
-            r = max(4, 8 * scale)
-            rounded_rect(chip, 0, 0, w, h, r, fill=C_ACCENT, outline=C_HOVER)
-            if scale >= 0.55:
-                chip.create_text(w / 2, h / 2, text=text, fill="#FFFFFF", font=Fonts.help)
-            return w, h
-
-        def place_at(cx: float, cy: float, scale: float) -> None:
-            w, h = paint(scale)
-            chip.place(x=int(cx - w / 2), y=int(cy - h / 2))
-            chip.lift()
-
-        place_at(sx, sy, 0.86)
-        t0 = time.perf_counter()
-        duration = 0.48
-
-        def tick() -> None:
-            if self._fly_chip is None or not chip.winfo_exists():
-                self._fly_after = None
-                return
-            p = min(1.0, (time.perf_counter() - t0) / duration)
-            # ease-in-out + 向上拋物线，末段缩小吸进图标
-            e = 0.5 - 0.5 * math.cos(math.pi * p)
-            arc = -46 * math.sin(math.pi * p)
-            scale = 1.0 if p < 0.68 else max(0.28, 1.0 - (p - 0.68) / 0.32 * 0.72)
-            place_at(sx + (ex - sx) * e, sy + (ey - sy) * e + arc, scale)
-            if p < 1:
-                self._fly_after = self.after(16, tick)
-            else:
-                self._cancel_task_fly()
-                self._refresh_links_badge()
-                self.nav_links.pulse_badge()
-
-        self._fly_after = self.after(16, tick)
+        self._refresh_links_badge()
+        nav = getattr(self, "nav_links", None)
+        if nav is not None and getattr(self, "_page", "") != "links":
+            try:
+                nav.pulse_badge()
+            except Exception:
+                pass
 
     def _toggle_log(self) -> None:
         self._log_open = not self._log_open
         if self._log_open:
-            self.btn_log.configure(text="▾  日志")
+            self.btn_log.configure(text="▾ 日志")
             self.log_wrap.grid(row=4, column=0, sticky="nsew", padx=16, pady=(0, 12))
             self.main.rowconfigure(4, weight=0)
             if not self.btn_clear_log.winfo_ismapped():
                 self.btn_clear_log.pack(side="right")
         else:
-            self.btn_log.configure(text="▸  日志")
+            self.btn_log.configure(text="▸ 日志")
             self.log_wrap.grid_forget()
             if self.btn_clear_log.winfo_ismapped():
                 self.btn_clear_log.pack_forget()
@@ -3200,8 +4021,7 @@ class App(tk.Tk):
         self._form_label(grid, "api_hash").grid(row=1, column=0, sticky="e", padx=(0, 10))
         self.var_api_hash = tk.StringVar(value=str(self.cfg.get("api_hash") or ""))
         self._form_entry(grid, self.var_api_hash, placeholder="从申请页复制").grid(row=1, column=1, sticky="ew")
-        FlatButton(b, "打开申请页", command=self._open_api_site, bg=C_CARD).pack(anchor="w", pady=(12, 12))
-        self._form_help(b, "只保存在本机，请不要发给别人。").pack(fill="x")
+        self._form_help(b, "只保存在本机，请不要发给别人。").pack(fill="x", pady=(12, 0))
         ft = tk.Frame(b, bg=C_CARD)
         ft.pack(fill="x", pady=(16, 0))
         FlatButton(ft, "保存并继续", command=self._save_api, variant="primary", bg=C_CARD).pack(side="right")
@@ -3214,8 +4034,8 @@ class App(tk.Tk):
         self._form_label(b, "手机号").pack(fill="x")
         self.var_phone = tk.StringVar()
         self._form_entry(b, self.var_phone, placeholder="11 位手机号，或 +区号").pack(fill="x", pady=(6, 6))
-        self._form_help(b, "与官方 Telegram 同一号码，大陆会自动加 +86。将使用已保存的 API 凭据。").pack(fill="x")
-        self._link_label_action(b, "修改 API 凭据", self._open_api_from_phone).pack(anchor="w", pady=(8, 0))
+        self._form_help(b, "与官方 Telegram 同一号码，大陆会自动加 +86。").pack(fill="x")
+        self._link_label_action(b, "更改 API 凭据", self._open_api_from_phone).pack(anchor="w", pady=(8, 0))
         ft = tk.Frame(b, bg=C_CARD)
         ft.pack(fill="x", pady=(16, 0))
         FlatButton(ft, "发送验证码", command=self._send_code, variant="primary", bg=C_CARD).pack(side="right")
@@ -3284,6 +4104,7 @@ class App(tk.Tk):
 
         self.lbl_proxy_status = tk.Label(b, text="", bg=C_CARD, fg=C_TEXT2, font=Fonts.help, anchor="w", justify="left", wraplength=400)
         self.lbl_proxy_status.pack(fill="x", pady=(12, 0))
+        tk.Label(b, text="改完需重启再生效", bg=C_CARD, fg=C_TEXT3, font=Fonts.help, anchor="w").pack(fill="x", pady=(6, 0))
 
         ft = tk.Frame(b, bg=C_CARD)
         ft.pack(fill="x", pady=(16, 0))
@@ -3299,10 +4120,14 @@ class App(tk.Tk):
         b = self.dlg_about.body
         row = tk.Frame(b, bg=C_CARD)
         row.pack(fill="x")
-        ic = tk.Canvas(row, width=36, height=36, highlightthickness=0, bd=0, bg=C_CARD)
-        ic.pack(side="left")
-        rounded_rect(ic, 0, 0, 36, 36, 8, fill=C_ACCENT, outline=C_ACCENT)
-        draw_download_icon(ic, 9, 9, "#FFFFFF", 18)
+        about_icon = self._load_about_icon()
+        if about_icon is not None:
+            tk.Label(row, image=about_icon, bg=C_CARD).pack(side="left")
+        else:
+            ic = tk.Canvas(row, width=40, height=40, highlightthickness=0, bd=0, bg=C_CARD)
+            ic.pack(side="left")
+            rounded_rect(ic, 0, 0, 40, 40, 8, fill=C_ACCENT, outline=C_ACCENT)
+            draw_download_icon(ic, 11, 11, "#FFFFFF", 18)
         texts = tk.Frame(row, bg=C_CARD)
         texts.pack(side="left", padx=12)
         tk.Label(texts, text=APP_NAME, bg=C_CARD, fg=C_TEXT, font=Fonts.title, anchor="w").pack(anchor="w")
@@ -3360,10 +4185,48 @@ class App(tk.Tk):
 
     # ----------------------------------------------------------- bootstrap
 
+    def _restore_unfinished_downloads(self) -> None:
+        tasks = [self.queue.get(key) for key in self.queue.keys()]
+        tasks = [task for task in tasks if task is not None]
+        if not tasks:
+            return
+        self._mirror_queue()
+        text = restored_link_text(tasks)
+        if text and hasattr(self, "txt_links"):
+            self.txt_links.set_text(text)
+        self.tasks.set_header(f"已恢复 {len(tasks)} 条未完成下载", show_stop=False)
+        self._log(f"已恢复 {len(tasks)} 条未完成下载。关闭前正在下载的已改为停止，不会自动继续。")
+
+    def _download_records(self) -> list[dict]:
+        return load_download_records(DOWNLOAD_INDEX_PATH)
+
+    def _remember_download(self, peer_id: Any, message: Any, path: Path, url: str = "") -> None:
+        peer = canonical_peer_id(peer_id)
+        message_id = getattr(message, "id", None)
+        if peer is None or not isinstance(message_id, int):
+            return
+        record_download(
+            DOWNLOAD_INDEX_PATH,
+            peer_id=peer,
+            message_id=message_id,
+            save_path=str(path),
+            document_id=primary_document_id(message),
+            url=url,
+        )
+        self._refresh_download_marks()
+
+    def _refresh_download_marks(self) -> None:
+        chat = getattr(self, "_video_chat", None)
+        if chat is None or not getattr(self, "_video_items", None):
+            return
+        apply_downloaded_marks(self._video_items, chat.id, self._download_records())
+        if hasattr(self, "video_list"):
+            self.video_list.refresh_download_marks()
+
     def _bootstrap(self) -> None:
         self._maybe_show_notice()
         self._maybe_autodetect_proxy()
-        if not has_api_credentials(self.cfg):
+        if startup_login_target(has_credentials=has_api_credentials(self.cfg), authorized=False) == "api":
             self._set_logged_in_state(False)
             self._show_dialog(self.dlg_api)
             return
@@ -3410,11 +4273,16 @@ class App(tk.Tk):
         self.var_api_hash.set(str(self.cfg.get("api_hash") or ""))
         self._show_dialog(self.dlg_api)
 
-    def _open_api_site(self) -> None:
+    def _load_about_icon(self) -> Optional[ImageTk.PhotoImage]:
+        png = resource_path("app-icon-64.png", "app-icon-256.png")
+        if png is None:
+            return None
         try:
-            webbrowser.open("https://my.telegram.org")
-        except Exception as exc:
-            messagebox.showerror(APP_NAME, explain_error(exc), parent=self.dlg_api)
+            img = Image.open(png).convert("RGBA").resize((40, 40), Image.Resampling.LANCZOS)
+            self._about_icon_img = ImageTk.PhotoImage(img)
+            return self._about_icon_img
+        except Exception:
+            return None
 
     def _fill_proxy_vars(self, item: dict) -> None:
         kind = str(item.get("type") or "socks5")
@@ -3496,9 +4364,16 @@ class App(tk.Tk):
         self._set_logged_in_state(False)
         self._log("需要登录账号。可点左侧边栏「登录」，或现在完成手机号验证。")
         # 若用户已经在输入手机号/验证码，不要把窗口切回去
-        if self._phone_pending or self._login_dialog_open(self.dlg_code, self.dlg_2fa, self.dlg_api):
-            return
-        if not self._login_dialog_open(self.dlg_phone):
+        target = startup_login_target(
+            has_credentials=has_api_credentials(self.cfg),
+            authorized=False,
+            phone_pending=bool(self._phone_pending),
+            code_dialog=self._login_dialog_open(self.dlg_code),
+            password_dialog=self._login_dialog_open(self.dlg_2fa),
+            api_dialog=self._login_dialog_open(self.dlg_api),
+            phone_dialog=self._login_dialog_open(self.dlg_phone),
+        )
+        if target == "phone":
             self._show_dialog(self.dlg_phone)
 
     def _login_dialog_open(self, *dialogs: ModalDialog) -> bool:
@@ -3517,10 +4392,8 @@ class App(tk.Tk):
             messagebox.showwarning(APP_NAME, msg + "\n\n将清除本机会话，请重新登录。api_id 和代理设置会保留。")
             clear_session_only()
             self.cfg = load_config()
-            if has_api_credentials(self.cfg):
-                self._show_dialog(self.dlg_phone)
-            else:
-                self._show_dialog(self.dlg_api)
+            target = login_dialog_after_session_loss(has_api_credentials(self.cfg))
+            self._show_dialog(self.dlg_phone if target == "phone" else self.dlg_api)
         else:
             messagebox.showerror(APP_NAME, msg)
 
@@ -3561,20 +4434,10 @@ class App(tk.Tk):
     def _refresh_chat_list(self) -> None:
         if not hasattr(self, "chat_list"):
             return
-        q = (self.ent_search.get() if hasattr(self, "ent_search") else self.var_search.get() or "").strip().lower()
+        q = (self.ent_search.get() if hasattr(self, "ent_search") else self.var_search.get() or "").strip()
         kind = getattr(self, "_chat_filter", "全部")
-        items: list[DialogItem] = []
-        for d in self._dialogs:
-            if kind != "全部" and d.kind != kind:
-                continue
-            hay = f"{d.title} {d.kind} {d.id}".lower()
-            if q and q not in hay:
-                continue
-            items.append(d)
-        selected = self._selected_dialog
-        if selected and not any(d.id == selected.id for d in items):
-            # 搜索/筛选时只取消高亮，不改右侧已加载的对话
-            selected = None
+        items = filter_dialogs(self._dialogs, kind, q)
+        selected = visible_chat_selection(self._selected_dialog, items)
         self.chat_list.set_items(items, selected)
         self.chat_list.apply_avatars(self._avatar_bytes, token=self._avatar_gen)
 
@@ -3650,20 +4513,11 @@ class App(tk.Tk):
         kind = (self.var_proxy_type.get() or "none").strip().lower()
         host = (self.var_proxy_host.get() or "").strip() or "127.0.0.1"
         port_s = (self.var_proxy_port.get() or "").strip()
-        if kind not in ("none", "socks5", "http", "off", "direct"):
-            messagebox.showerror(APP_NAME, "代理类型请选择 直连、SOCKS5 或 HTTP。", parent=self.dlg_proxy)
+        try:
+            kind, port = validate_proxy_settings(kind, port_s)
+        except UserFacingError as exc:
+            messagebox.showerror(APP_NAME, str(exc), parent=self.dlg_proxy)
             return
-        if kind in ("none", "off", "direct"):
-            kind = "none"
-            port: Any = port_s
-        else:
-            try:
-                port = int(port_s)
-            except ValueError:
-                port = 0
-            if port <= 0 or port > 65535:
-                messagebox.showerror(APP_NAME, "端口应为 1–65535 之间的数字。", parent=self.dlg_proxy)
-                return
         self.cfg = update_config(
             proxy_type=kind,
             proxy_host=host,
@@ -3838,101 +4692,368 @@ class App(tk.Tk):
         return path
 
     def _collect_links(self) -> list[str]:
-        raw = self.txt_links.get_text()
-        items: list[str] = []
-        seen: set[str] = set()
-        for part in raw.replace(",", " ").split():
-            text = part.strip().strip("，；;")
-            if text and text not in seen:
-                seen.add(text)
-                items.append(text)
-        return items
+        return split_link_text(self.txt_links.get_text())
+
+    def _confirm_delete(self, name: str) -> bool:
+        result = {"ok": False}
+        done = tk.BooleanVar(self, value=False)
+        dlg = ModalDialog(self, "删除任务", width=420)
+
+        def finish(ok: bool) -> None:
+            if done.get():
+                return
+            result["ok"] = ok
+            try:
+                dlg.grab_release()
+            except Exception:
+                pass
+            try:
+                dlg.withdraw()
+            except Exception:
+                pass
+            done.set(True)
+
+        dlg.set_on_hide(lambda: finish(False))
+        tk.Label(
+            dlg.body,
+            text=f"确定删除「{name}」？",
+            bg=C_CARD,
+            fg=C_TEXT,
+            font=Fonts.body,
+            anchor="w",
+            justify="left",
+            wraplength=380,
+        ).pack(fill="x")
+        ft = tk.Frame(dlg.body, bg=C_CARD)
+        ft.pack(fill="x", pady=(18, 0))
+        FlatButton(ft, "删除", command=lambda: finish(True), variant="danger", bg=C_CARD).pack(side="right")
+        FlatButton(ft, "取消", command=lambda: finish(False), bg=C_CARD).pack(side="right", padx=(0, 8))
+        dlg.show()
+        self.wait_variable(done)
+        try:
+            dlg.destroy()
+        except Exception:
+            pass
+        return result["ok"]
+
+    def _on_stop_one(self, key: str) -> None:
+        self.queue.halt(key)
+        self._paint_task(key)
+        self._refresh_task_header(done=not self._busy)
+
+    def _on_remove_task(self, key: str) -> None:
+        item = self.queue.get(key)
+        label = ((item.name or item.url) if item else "") or key
+        if not self._confirm_delete(label):
+            return
+        action = self.queue.remove(key)
+        self.tasks.remove(key)
+        if action == "cancelled":
+            self._log(f"已取消并移除：{label}")
+        elif action == "removed":
+            self._log(f"已移除：{label}")
+        if not self.tasks.has_items():
+            self.tasks.set_header("就绪", show_stop=self._busy)
+        else:
+            self._refresh_task_header(done=not self._busy)
+
+    def _mirror_queue(self) -> None:
+        selected_keys = set(self.tasks.keys())
+        self.tasks.clear()
+        for key in self.queue.keys():
+            item = self.queue.get(key)
+            if item is None or self.queue.cancelled(key):
+                continue
+            self.tasks.upsert(
+                key,
+                item.name,
+                item.status,
+                current=item.current,
+                total=item.total,
+                speed=item.speed,
+                error=item.error,
+            )
+        del selected_keys
+        self._refresh_task_header(done=not self._busy)
+        self._relayout_tasks()
+
+    def _restore_queue_task(self, item: Any) -> None:
+        self.queue.upsert(
+            item.key,
+            item.name,
+            item.status,
+            url=item.url,
+            error=item.error,
+            current=item.current,
+            total=item.total,
+            speed=item.speed,
+            peer_id=item.peer_id,
+            message_id=item.message_id,
+            document_id=item.document_id,
+            save_path=item.save_path,
+        )
+
+    def _seed_tasks(self, rows: list[tuple[str, str, str, str, str, int]], *, paint_now: bool = False) -> None:
+        """rows: key, name, status, url, error, total。先写入队列，再刷新界面。
+
+        清空队列前先留下「当前任务还在跑时新加的视频」，避免被这次 clear 冲掉。
+        """
+        with self._queue_mutate_lock:
+            seed_keys = [row[0] for row in rows]
+            order = merge_queue_keys(seed_keys, self._preserved_queue_keys)
+            saved = []
+            seed_set = set(seed_keys)
+            for key in order:
+                if key in seed_set:
+                    continue
+                item = self.queue.get(key)
+                if item is not None:
+                    saved.append(item)
+            self.queue.clear()
+            for key, name, status, url, error, total in rows:
+                self.queue.upsert(key, name, status, url=url, error=error, total=total)
+            for item in saved:
+                self._restore_queue_task(item)
+        if paint_now:
+            self._mirror_queue()
+        else:
+            self._ui(self._mirror_queue)
+
+    def _append_tasks(self, rows: list[tuple[str, str, str, str, str, int]]) -> None:
+        """Add rows without clearing the list. Existing keys keep their status."""
+        with self._queue_mutate_lock:
+            for key, name, status, url, error, total in rows:
+                if self.queue.get(key) is None:
+                    self.queue.upsert(key, name, status, url=url, error=error, total=total)
+                self._preserved_queue_keys.discard(key)
+        self._ui(self._mirror_queue)
+
+    def _paint_task(self, key: str) -> None:
+        if self.queue.cancelled(key):
+            self.tasks.remove(key)
+            return
+        item = self.queue.get(key)
+        if item is None:
+            self.tasks.remove(key)
+            return
+        self.tasks.upsert(
+            key,
+            item.name,
+            item.status,
+            current=item.current,
+            total=item.total,
+            speed=item.speed,
+            error=item.error,
+        )
+
+    def _set_task(
+        self,
+        key: str,
+        name: str,
+        status: str,
+        *,
+        url: str = "",
+        error: str = "",
+        current: int = 0,
+        total: int = 0,
+        speed: float = 0.0,
+        save_path: str = "",
+    ) -> bool:
+        if self.queue.cancelled(key):
+            return False
+        extra: dict[str, Any] = {}
+        if save_path:
+            extra["save_path"] = save_path
+        self.queue.upsert(
+            key,
+            name,
+            status,
+            url=url,
+            error=error,
+            current=current,
+            total=total,
+            speed=speed,
+            **extra,
+        )
+        self._ui(lambda k=key: self._paint_task(k))
+        return True
 
     def _on_download_link(self) -> None:
         if self._busy:
-            messagebox.showinfo(APP_NAME, "当前有任务在进行，请稍候或先停止。")
+            messagebox.showinfo(APP_NAME, "当前有任务在进行，请稍候或先暂停。")
             return
         links = self._collect_links()
         if not links:
             messagebox.showwarning(APP_NAME, "请先粘贴帖子链接，多条请换行。")
             return
         try:
-            parsed_list = [parse_telegram_link(link) for link in links]
             folder = self._save_folder()
         except Exception as exc:
             messagebox.showerror(APP_NAME, explain_error(exc))
             return
-        label = "链接下载" if len(parsed_list) == 1 else f"链接下载（{len(parsed_list)} 条）"
-        self._start_task(self._async_download_links(parsed_list, folder), label=label)
+        jobs = plan_link_jobs(links)
+        if not jobs:
+            messagebox.showwarning(APP_NAME, "请先粘贴帖子链接，多条请换行。")
+            return
+        self._task_gen += 1
+        gen = self._task_gen
+        if not any(job.parsed for job in jobs):
+            self._stop_flag.clear()
+            self._seed_tasks(self._link_rows(gen, jobs), paint_now=True)
+            self.tasks.set_header(f"完成：成功 0，失败 {len(jobs)}", show_stop=False)
+            self._log("这些链接都无法识别，没有开始下载。失败的那一条可以点「删除」去掉。")
+            return
+        valid = sum(1 for job in jobs if job.parsed)
+        label = "链接下载" if valid == 1 and len(jobs) == 1 else f"链接下载（{len(jobs)} 条）"
+        self._start_task(self._async_download_links(jobs, folder, gen), label=label)
 
-    async def _async_download_links(self, parsed_list: list[Any], folder: Path) -> None:
+    def _link_rows(self, gen: int, jobs: list[Any]) -> list[tuple[str, str, str, str, str, int]]:
+        rows = []
+        for i, job in enumerate(jobs):
+            key = f"{gen}-link-{i}"
+            if job.error:
+                rows.append((key, job.raw, "error", job.raw, job.error, 0))
+            else:
+                rows.append((key, job.raw, "queued", job.raw, "", 0))
+        return rows
+
+    async def _async_download_links(self, jobs: list[Any], folder: Path, gen: int) -> None:
         assert self.service
         ok = fail = 0
-        total_links = len(parsed_list)
+        total_links = len(jobs)
+        self._seed_tasks(self._link_rows(gen, jobs))
 
-        def _seed() -> None:
-            self.tasks.clear()
-            for i, parsed in enumerate(parsed_list):
-                self.tasks.upsert(f"link-{i}", parsed.raw, "queued")
-            self._refresh_task_header()
-            self._relayout_tasks()
-
-        self._ui(_seed)
-
-        for li, parsed in enumerate(parsed_list):
+        for li, job in enumerate(jobs):
+            key = f"{gen}-link-{li}"
+            if job.error or job.parsed is None:
+                fail += 1
+                if job.error:
+                    self._ui_log(job.error, error=True)
+                continue
             if self._stop_flag.is_set():
                 self._ui_log("已停止。")
-                self._ui(lambda: self._mark_remaining_stopped())
+                self._ui(self._mark_remaining_stopped)
                 break
-            self._ui(lambda k=f"link-{li}", n=parsed.raw: self.tasks.upsert(k, n, "running"))
+            if self.queue.cancelled(key) or self.queue.halted(key):
+                continue
+            parsed = job.parsed
+            self._set_task(key, parsed.raw, "running", url=parsed.raw)
+            self._ui(self._refresh_task_header)
             self._ui_log(f"解析链接（{li + 1}/{total_links}）：{parsed.raw}")
             try:
                 entity, message = await self.service.resolve_link(parsed)
+                if self.queue.cancelled(key):
+                    continue
                 title = self.service.entity_title(entity)
                 album = await self.service.album_messages(entity, message)
                 videos = [(m, message_video_kind(m)) for m in album if message_video_kind(m)]
                 if not videos:
                     raise UserFacingError(
-                        f"消息 #{message.id}（{title}，{format_datetime(getattr(message, 'date', None))}）"
+                        f"链接 {parsed.raw} · 消息 #{message.id}（{title}，"
+                        f"{format_datetime(getattr(message, 'date', None))}）"
                         f"不含视频 / 圆形视频 / 动态 GIF。"
                     )
                 replacements = [
                     (
-                        f"link-{li}-msg-{msg.id}",
+                        f"{gen}-link-{li}-msg-{msg.id}",
                         task_display_name(msg, title),
                         preferred_media_size(msg, quality_pref_value(self.var_quality.get())) or 0,
+                        parsed.raw,
                     )
                     for msg, _kind in videos
                 ]
-                self._ui(lambda old=f"link-{li}", items=replacements: self.tasks.replace_key(old, items))
+                # 队列立刻替换，避免用户点删除时界面还停在旧的占位行。
+                self.queue.replace(key, replacements)
+                peer = canonical_peer_id(entity)
+                for msg, _kind in videos:
+                    self.queue.note_identity(
+                        f"{gen}-link-{li}-msg-{msg.id}",
+                        peer_id=peer,
+                        message_id=getattr(msg, "id", None),
+                        document_id=primary_document_id(msg),
+                    )
+                self._ui(lambda old=key, items=replacements: self._paint_replaced_link(old, items))
                 self._ui_log(f"对话：{title} · 消息 {message.id} · 发现 {len(videos)} 个视频媒体")
                 for idx, (msg, kind) in enumerate(videos, 1):
+                    child = f"{gen}-link-{li}-msg-{msg.id}"
                     if self._stop_flag.is_set():
                         self._ui_log("已停止。")
-                        self._ui(lambda: self._mark_remaining_stopped())
+                        self._ui(self._mark_remaining_stopped)
                         return
-                    key = f"link-{li}-msg-{msg.id}"
+                    if self.queue.cancelled(key) or self.queue.cancelled(child) or self.queue.halted(child):
+                        continue
                     name = task_display_name(msg, title)
                     try:
                         path = await self._download_one(
-                            entity, msg, folder, title, kind, idx, len(videos), task_key=key, display_name=name
+                            entity,
+                            msg,
+                            folder,
+                            title,
+                            kind,
+                            idx,
+                            len(videos),
+                            task_key=child,
+                            display_name=name,
+                            source_url=parsed.raw,
                         )
+                        if self.queue.cancelled(child):
+                            continue
                         ok += 1
                         size = path.stat().st_size if path.exists() else (message_file_size(msg) or 0)
-                        self._ui(lambda k=key, n=name, s=size: self.tasks.upsert(k, n, "done", current=s, total=s))
-                        self._ui_log(f"✓ 已保存：{path.name}")
+                        self._remember_download(entity, msg, path, url=parsed.raw)
+                        self._set_task(
+                            child, name, "done", url=parsed.raw, current=size, total=size, save_path=str(path)
+                        )
+                        self._ui_log(f"✓ 已保存：{path.name}（{parsed.raw}）")
                     except Exception as exc:
+                        if self.queue.cancelled(child):
+                            continue
+                        if is_user_stop(exc):
+                            self._ui_log("已停止。")
+                            if self._row_stop_only(child):
+                                self._ui(lambda k=child: self._paint_task(k))
+                                continue
+                            self._ui(self._mark_remaining_stopped)
+                            return
                         fail += 1
-                        err = explain_error(exc)
-                        self._ui(lambda k=key, n=name, e=err: self.tasks.upsert(k, n, "error", error=e))
+                        err = link_failure_text(parsed.raw, exc, message_id=getattr(msg, "id", None), title=title)
+                        self._set_task(child, name, "error", url=parsed.raw, error=err)
                         self._ui_log(err, error=True)
             except Exception as exc:
+                if self.queue.cancelled(key):
+                    continue
+                if is_user_stop(exc):
+                    self._ui_log("已停止。")
+                    if self._row_stop_only(key):
+                        self._ui(lambda k=key: self._paint_task(k))
+                        continue
+                    self._ui(self._mark_remaining_stopped)
+                    break
                 fail += 1
-                err = explain_error(exc)
-                self._ui(lambda k=f"link-{li}", n=parsed.raw, e=err: self.tasks.upsert(k, n, "error", error=e))
+                err = link_failure_text(job.raw, exc)
+                self._set_task(key, job.raw, "error", url=job.raw, error=err)
                 self._ui_log(err, error=True)
-        self._ui(lambda: self._refresh_task_header(done=True, ok=ok, fail=fail))
+        self._schedule_batch_header(ok, fail)
         self._ui_log(f"完成：成功 {ok}，失败 {fail}。保存目录：{folder}")
+
+    def _paint_replaced_link(self, old: str, items: list[tuple[str, str, int, str]]) -> None:
+        self.tasks.remove(old)
+        if self.queue.cancelled(old):
+            return
+        for key, name, total, _url in items:
+            if self.queue.cancelled(key):
+                continue
+            current = self.queue.get(key)
+            status = current.status if current else "queued"
+            shown_total = current.total if current else total
+            self.tasks.upsert(
+                key,
+                current.name if current else name,
+                status,
+                total=shown_total,
+                current=current.current if current else 0,
+                error=current.error if current else "",
+            )
 
     def _start_load_videos(self, item: DialogItem, reset: bool = True) -> None:
         if not self.service:
@@ -3941,7 +5062,8 @@ class App(tk.Tk):
         self._video_chat = item
         if reset:
             self._video_items = []
-            self._video_offset_id = 0
+            self._video_scan = VideoScanState()
+            self._video_notices = []
             self._video_has_more = True
             self.video_list.clear()
             self._video_gen += 1
@@ -3951,15 +5073,15 @@ class App(tk.Tk):
         if reset:
             self._show_video_empty("正在加载视频…")
         self._sync_chat_actions()
-        offset_id = 0 if reset else self._video_offset_id
+        state = self._video_scan
         self._run_async(
-            self._async_list_videos(item, gen, offset_id),
+            self._async_list_videos(item, gen, state),
             on_error=lambda exc, g=gen: self._on_videos_error(g, exc),
         )
 
-    async def _async_list_videos(self, item: DialogItem, gen: int, offset_id: int) -> None:
+    async def _async_list_videos(self, item: DialogItem, gen: int, state: VideoScanState) -> None:
         assert self.service
-        videos = await self.service.list_chat_videos(item.entity, limit=30, offset_id=offset_id)
+        page = await self.service.list_chat_videos(item.entity, limit=30, state=state)
 
         loop = asyncio.get_running_loop()
         applied = loop.create_future()
@@ -3967,7 +5089,7 @@ class App(tk.Tk):
         def _apply() -> None:
             try:
                 if gen == self._video_gen:
-                    self._apply_video_page(item, gen, videos)
+                    self._apply_video_page(item, gen, page)
             finally:
                 if not applied.done():
                     loop.call_soon_threadsafe(applied.set_result, None)
@@ -3977,9 +5099,11 @@ class App(tk.Tk):
         if gen != self._video_gen:
             return
         # 压缩/缓存图只作占位；这里再拉最大静帧封面。切换对话后由 generation 丢弃过期结果。
-        for v in videos:
+        for v in page.items:
             if gen != self._video_gen:
                 return
+            if not v.downloadable:
+                continue
             try:
                 data = await self.service.download_video_thumb(v)
             except Exception:
@@ -3988,30 +5112,44 @@ class App(tk.Tk):
                 continue
             self._ui(lambda mid=v.message_id, b=data, g=gen: self._apply_video_thumb(g, mid, b))
 
-    def _apply_video_page(self, item: DialogItem, gen: int, videos: list[VideoItem]) -> None:
+    def _apply_video_page(self, item: DialogItem, gen: int, page: Any) -> None:
         if gen != self._video_gen or self._video_chat is None or self._video_chat.id != item.id:
             return
+        videos = list(page.items)
+        if self._video_chat is not None:
+            apply_downloaded_marks(videos, self._video_chat.id, self._download_records())
         self._video_loading = False
+        self._video_scan = page.state
+        self._video_notices = list(page.notices)
+        for note in page.notices:
+            self._log(note)
         if not self._video_items:
-            # 第一页
             self._video_items = list(videos)
             if not videos:
-                self._video_has_more = False
-                self._show_video_empty("这个对话里没有可下载的视频")
+                self._show_video_empty(
+                    "\n".join(page.notices[:4]) if page.notices else "这个对话里没有可下载的视频"
+                )
             else:
                 self.video_list.set_items(self._video_items)
                 self._show_video_list()
         else:
             existing = {v.message_id for v in self._video_items}
             added = [v for v in videos if v.message_id not in existing]
-            self._video_items.extend(added)
-            if added:
-                self.video_list.append_items(added)
+            if added and self._video_items and any(v.message_id > self._video_items[-1].message_id for v in added):
+                self._video_items.extend(added)
+                self._video_items.sort(key=lambda v: v.message_id, reverse=True)
+                self.video_list.set_items(
+                    self._video_items,
+                    selected=self.video_list.selected_ids,
+                    reset_scroll=False,
+                )
+            else:
+                self._video_items.extend(added)
+                if added:
+                    self.video_list.append_items(added)
             if self._video_items:
                 self._show_video_list()
-        if videos:
-            self._video_offset_id = min(v.message_id for v in videos)
-        self._video_has_more = len(videos) >= 30
+        self._video_has_more = bool(page.has_more)
         self._sync_quality_options()
         self.video_list.refresh_quality(quality_pref_value(self.var_quality.get()))
         self._sync_chat_actions()
@@ -4045,9 +5183,48 @@ class App(tk.Tk):
             return
         self._start_load_videos(self._video_chat, reset=False)
 
+    def _chat_task_rows(
+        self, gen: int, messages: list[Any], title: str
+    ) -> list[tuple[str, str, str, str, str, int]]:
+        rows = []
+        for msg in messages:
+            key = f"{gen}-msg-{msg.id}"
+            name = task_display_name(msg, title)
+            total = preferred_media_size(msg, self._quality_pref()) or 0
+            rows.append((key, name, "queued", "", "", total))
+        return rows
+
+    def _note_chat_identities(self, gen: int, messages: list[Any], peer_id: Any) -> None:
+        peer = canonical_peer_id(peer_id)
+        for msg in messages:
+            self.queue.note_identity(
+                f"{gen}-msg-{msg.id}",
+                peer_id=peer,
+                message_id=getattr(msg, "id", None),
+                document_id=primary_document_id(msg),
+            )
+
+    def _enqueue_chat_download(self, item: DialogItem, messages: list[Any], folder: Path) -> None:
+        """Queue more chat videos without clearing the download that is running."""
+        self._task_gen += 1
+        gen = self._task_gen
+        title = item.title or ""
+        rows = self._chat_task_rows(gen, messages, title)
+        with self._queue_mutate_lock:
+            for key, name, status, url, error, total in rows:
+                self._preserved_queue_keys.add(key)
+                self.queue.upsert(key, name, status, url=url, error=error, total=total)
+            self._note_chat_identities(gen, messages, item.id)
+            self._queued_chat_batches.append((item, messages, folder, gen))
+        for key, name, status, _url, _error, total in rows:
+            self.tasks.upsert(key, name, status, total=total)
+        self._refresh_task_header()
+        self._log(f"已加入 {len(messages)} 个视频，会在当前任务后继续下载。")
+        self._fly_task_to_links(len(messages))
+
     def _on_download_selected(self) -> None:
-        if self._busy:
-            messagebox.showinfo(APP_NAME, "当前有任务在进行，请稍候或先停止。")
+        if self._busy and self._stop_flag.is_set():
+            messagebox.showinfo(APP_NAME, "正在暂停，请稍候再开始新的下载。")
             return
         item = self._video_chat or self._selected_dialog
         if not item:
@@ -4064,14 +5241,40 @@ class App(tk.Tk):
         except Exception as exc:
             messagebox.showerror(APP_NAME, explain_error(exc))
             return
-        self._start_task(self._async_download_selected(item, messages, folder), label="对话下载")
+        if not self.service:
+            messagebox.showwarning(APP_NAME, "尚未连接，请先完成登录。")
+            return
+        if chat_download_action(self._busy) == "enqueue":
+            self._enqueue_chat_download(item, messages, folder)
+            return
+        self._task_gen += 1
+        gen = self._task_gen
+        title = item.title or ""
+        self._set_busy_ui(True)
+        self._seed_tasks(self._chat_task_rows(gen, messages, title), paint_now=True)
+        self._note_chat_identities(gen, messages, item.id)
+        self._start_task(
+            self._async_download_selected(item, messages, folder, gen=gen, append=True),
+            label="对话下载",
+            keep_tasks=True,
+        )
         self._fly_task_to_links(len(messages))
 
-    async def _async_download_selected(self, item: DialogItem, messages: list[Any], folder: Path) -> None:
+    async def _async_download_selected(
+        self,
+        item: DialogItem,
+        messages: list[Any],
+        folder: Path,
+        *,
+        gen: Optional[int] = None,
+        append: bool = False,
+    ) -> None:
         assert self.service
         entity = await self.service.resolve_entity(item.entity)
         title = item.title or self.service.entity_title(entity)
-        await self._download_message_list(entity, title, messages, folder)
+        await self._download_message_list(
+            entity, title, messages, folder, peer_id=item.id, gen=gen, append=append
+        )
 
     async def _download_message_list(
         self,
@@ -4079,43 +5282,65 @@ class App(tk.Tk):
         title: str,
         messages: list[Any],
         folder: Path,
+        peer_id: Any = None,
+        gen: Optional[int] = None,
+        append: bool = False,
     ) -> None:
         total = len(messages)
         self._ui_log(f"准备下载 {total} 个视频媒体 → {folder}")
-
-        def _seed() -> None:
-            self.tasks.clear()
-            for msg in messages:
-                key = f"msg-{msg.id}"
-                name = task_display_name(msg, title)
-                self.tasks.upsert(key, name, "queued", total=preferred_media_size(msg, self._quality_pref()) or 0)
-            self._refresh_task_header()
-            self._relayout_tasks()
-
-        self._ui(_seed)
+        if gen is None:
+            self._task_gen += 1
+            gen = self._task_gen
+        rows = self._chat_task_rows(gen, messages, title)
+        if append:
+            self._append_tasks(rows)
+        else:
+            self._seed_tasks(rows)
+        peer = canonical_peer_id(peer_id if peer_id is not None else entity)
+        for msg in messages:
+            self.queue.note_identity(
+                f"{gen}-msg-{msg.id}",
+                peer_id=peer,
+                message_id=getattr(msg, "id", None),
+                document_id=primary_document_id(msg),
+            )
         ok = fail = 0
         for idx, msg in enumerate(messages, 1):
+            key = f"{gen}-msg-{msg.id}"
             if self._stop_flag.is_set():
                 self._ui_log("已停止。")
-                self._ui(lambda: self._mark_remaining_stopped())
+                self._ui(self._mark_remaining_stopped)
                 break
+            if self.queue.cancelled(key) or self.queue.halted(key):
+                continue
             kind = message_video_kind(msg)
-            key = f"msg-{msg.id}"
             name = task_display_name(msg, title)
             try:
                 path = await self._download_one(
                     entity, msg, folder, title, kind, idx, total, task_key=key, display_name=name
                 )
+                if self.queue.cancelled(key):
+                    continue
                 ok += 1
                 size = path.stat().st_size if path.exists() else (message_file_size(msg) or 0)
-                self._ui(lambda k=key, n=name, s=size: self.tasks.upsert(k, n, "done", current=s, total=s))
+                self._remember_download(peer, msg, path)
+                self._set_task(key, name, "done", current=size, total=size, save_path=str(path))
                 self._ui_log(f"✓ [{idx}/{total}] {path.name}")
             except Exception as exc:
+                if self.queue.cancelled(key):
+                    continue
+                if is_user_stop(exc):
+                    self._ui_log("已停止。")
+                    if self._row_stop_only(key):
+                        self._ui(lambda k=key: self._paint_task(k))
+                        continue
+                    self._ui(self._mark_remaining_stopped)
+                    break
                 fail += 1
-                err = explain_error(exc)
-                self._ui(lambda k=key, n=name, e=err: self.tasks.upsert(k, n, "error", error=e))
-                self._ui_log(f"✗ [{idx}/{total}] 消息 {getattr(msg, 'id', '?')}：{err}", error=True)
-        self._ui(lambda: self._refresh_task_header(done=True, ok=ok, fail=fail))
+                err = link_failure_text("", exc, message_id=getattr(msg, "id", None), title=title)
+                self._set_task(key, name, "error", error=err)
+                self._ui_log(err, error=True)
+        self._schedule_batch_header(ok, fail)
         self._ui_log(f"完成：成功 {ok}，失败 {fail}。")
 
     async def _download_one(
@@ -4129,30 +5354,39 @@ class App(tk.Tk):
         total: int,
         task_key: str = "",
         display_name: str = "",
+        source_url: str = "",
     ) -> Path:
         assert self.service
-        label = kind_label(kind)
-        mid = getattr(msg, "id", 0)
         name = display_name or task_display_name(msg, title)
         known = preferred_media_size(msg, self._quality_pref()) or 0
         started = time.monotonic()
         if task_key:
-            self._ui(lambda: self.tasks.upsert(task_key, name, "running", current=0, total=known))
-            self._ui(lambda: self._refresh_task_header())
+            self._set_task(task_key, name, "running", url=source_url, current=0, total=known)
+            self._ui(self._refresh_task_header)
 
         def progress(cur: int, tot: int) -> None:
             elapsed = max(time.monotonic() - started, 0.001)
             speed = cur / elapsed
 
             def _upd() -> None:
-                if task_key:
+                if task_key and not self.queue.cancelled(task_key) and not self.queue.halted(task_key):
+                    self.queue.upsert(
+                        task_key, name, "running", url=source_url, current=cur, total=tot or known, speed=speed
+                    )
                     self.tasks.upsert(task_key, name, "running", current=cur, total=tot or known, speed=speed)
                     self._refresh_task_header()
 
             self._ui(_upd)
 
-        while True:
+        def _cancelled() -> bool:
             if self._stop_flag.is_set():
+                return True
+            if not task_key:
+                return False
+            return self.queue.cancelled(task_key) or self.queue.halted(task_key)
+
+        while True:
+            if _cancelled():
                 raise UserFacingError("已停止。")
             try:
                 return await self.service.download_message_video(
@@ -4161,36 +5395,87 @@ class App(tk.Tk):
                     folder,
                     progress=progress,
                     chat_title=title,
-                    should_cancel=lambda: self._stop_flag.is_set(),
+                    should_cancel=_cancelled,
                     quality=quality_pref_value(self.var_quality.get()),
                 )
             except FloodWaitError as exc:
                 seconds = int(getattr(exc, "seconds", 0) or 0)
-                self._ui_log(f"请求过于频繁，自动等待 {seconds} 秒后再继续…（可点停止）")
-                await self._sleep_interruptible(seconds)
+                self._ui_log(f"请求过于频繁，自动等待 {seconds} 秒后再继续…（可点暂停）")
+                await self._sleep_interruptible(seconds, should_cancel=_cancelled, task_key=task_key)
+                if _cancelled():
+                    raise UserFacingError("已停止。")
 
-    async def _sleep_interruptible(self, seconds: int) -> None:
-        left = seconds
+    def _row_stop_only(self, key: str) -> bool:
+        return bool(key) and self.queue.halted(key) and not self._stop_flag.is_set()
+
+    def _show_flood_wait(self, key: str, seconds: int) -> None:
+        text = flood_wait_text(seconds)
+        item = self.queue.get(key) if key else None
+        if item is not None and not self.queue.halted(key) and not self.queue.cancelled(key):
+            if seconds > 0:
+                self.tasks.upsert(
+                    key,
+                    item.name,
+                    "waiting",
+                    current=item.current,
+                    total=item.total,
+                    speed=0.0,
+                    error=text,
+                )
+            else:
+                self.tasks.upsert(
+                    key,
+                    item.name,
+                    "running",
+                    current=item.current,
+                    total=item.total,
+                    speed=0.0,
+                )
+        self._refresh_task_header()
+
+    async def _sleep_interruptible(
+        self,
+        seconds: int,
+        should_cancel: Optional[Callable[[], bool]] = None,
+        task_key: str = "",
+    ) -> None:
+        left = max(0, int(seconds))
         while left > 0 and not self._stop_flag.is_set():
+            if should_cancel and should_cancel():
+                return
+            self._ui(lambda l=left, k=task_key: self._show_flood_wait(k, l))
             step = min(1, left)
             await asyncio.sleep(step)
             left -= step
-            self._ui(lambda l=left: self.tasks.set_header("限流等待中…", f"剩余 {l} 秒", show_stop=True))
+        self._ui(lambda l=left, k=task_key: self._show_flood_wait(k, l))
 
     def _mark_remaining_stopped(self) -> None:
-        for key in list(self.tasks.keys()):
-            item = self.tasks.get(key)
-            if item and item["status"] in ("queued", "running"):
-                self.tasks.upsert(
-                    key,
-                    item["name"],
-                    "stopped",
-                    current=item.get("current") or 0,
-                    total=item.get("total") or 0,
-                )
+        self.queue.mark_stopped()
+        for key in list(self.queue.keys()):
+            item = self.queue.get(key)
+            if item is None or self.queue.cancelled(key):
+                continue
+            self.tasks.upsert(
+                key,
+                item.name,
+                item.status,
+                current=item.current,
+                total=item.total,
+                speed=0.0,
+                error=item.error,
+            )
         self._refresh_task_header(done=True)
 
     def _refresh_task_header(self, done: bool = False, ok: int = 0, fail: int = 0) -> None:
+        summary = self.tasks.summary()
+        running = summary.get("running", 0)
+        waiting = summary.get("waiting", 0)
+        stopped = summary.get("stopped", 0)
+        queued = summary.get("queued", 0)
+        finished = summary.get("done", 0) + summary.get("error", 0) + stopped
+        total = sum(summary.values())
+        speed = self.tasks.current_speed()
+        speed_text = format_speed(speed) if speed else ""
         if done:
             show_open = bool(ok or self.tasks.has_items())
             if fail or ok:
@@ -4199,46 +5484,98 @@ class App(tk.Tk):
                 title = "已停止" if self._stop_flag.is_set() else "就绪"
                 self.tasks.set_header(title, show_stop=False, show_open=show_open and self._stop_flag.is_set())
             return
-        _done, running, total = self.tasks.counts()
+        if waiting or (stopped and (running or waiting)):
+            parts = []
+            if running:
+                parts.append(f"下载中 {running}")
+            if waiting:
+                parts.append(f"等待 {waiting}")
+            if stopped:
+                parts.append(f"已停止 {stopped}")
+            title = " · ".join(parts) if parts else "下载中"
+            self.tasks.set_header(title, speed=speed_text, show_stop=bool(running or waiting or queued or self._busy))
+            return
         if self._busy and total:
-            idx = min(_done + (1 if running else 0), total) or total
-            speed = self.tasks.current_speed()
-            meta = f"·  {format_speed(speed)}" if speed else ""
-            self.tasks.set_header(f"下载中 {idx}/{total}", meta, show_stop=True)
+            idx = min(finished + (1 if running or waiting else 0), total) or total
+            self.tasks.set_header(f"下载中 {idx}/{total}", speed=speed_text, show_stop=True)
         elif total:
             self.tasks.set_header("就绪", show_stop=False)
         else:
             self.tasks.set_header("就绪", show_stop=self._busy)
 
+    def _schedule_batch_header(self, ok: int, fail: int) -> None:
+        more = bool(self._queued_chat_batches)
+        self._ui(lambda m=more, o=ok, f=fail: self._refresh_task_header(done=not m, ok=o, fail=f))
+
+    def _abandon_queued_chats(self) -> None:
+        with self._queue_mutate_lock:
+            batches = list(self._queued_chat_batches)
+            self._queued_chat_batches.clear()
+        for _item, messages, _folder, gen in batches:
+            for msg in messages:
+                key = f"{gen}-msg-{getattr(msg, 'id', '')}"
+                self._preserved_queue_keys.discard(key)
+                current = self.queue.get(key)
+                if current is not None and current.status in ("queued", "running", "waiting"):
+                    self.queue.halt(key)
+                    self._paint_task(key)
+
+    def _finish_task_ui(self) -> None:
+        self._set_busy_ui(False)
+        try:
+            title = str(self.tasks.lbl_title.cget("text"))
+        except Exception:
+            title = ""
+        if not title.startswith("完成") and not title.startswith("已停止"):
+            self._refresh_task_header(done=True)
+
+    def _on_task_done(self, _result: Any = None) -> None:
+        if self._stop_flag.is_set():
+            self._abandon_queued_chats()
+            self._preserved_queue_keys.clear()
+            self._finish_task_ui()
+            return
+        batch = None
+        with self._queue_mutate_lock:
+            if self._queued_chat_batches:
+                batch = self._queued_chat_batches.pop(0)
+        if batch is not None:
+            item, messages, folder, gen = batch
+            self._run_async(
+                self._async_download_selected(item, messages, folder, gen=gen, append=True),
+                on_done=self._on_task_done,
+                on_error=self._on_task_error,
+            )
+            return
+        self._preserved_queue_keys.clear()
+        self._finish_task_ui()
+
+    def _on_task_error(self, exc: BaseException) -> None:
+        self._abandon_queued_chats()
+        self._preserved_queue_keys.clear()
+        self._set_busy_ui(False)
+        msg = explain_error(exc)
+        self._log(msg, error=True)
+        self.tasks.set_header("失败", show_stop=False)
+        messagebox.showerror(APP_NAME, msg)
+
     # -------------------------------------------------------------- tasks
-    def _start_task(self, coro: Any, label: str) -> None:
+    def _start_task(self, coro: Any, label: str, *, keep_tasks: bool = False) -> None:
         if not self.service:
             messagebox.showwarning(APP_NAME, "尚未连接，请先完成登录。")
             return
         self._stop_flag.clear()
         self._set_busy_ui(True)
-        self.tasks.clear()
+        if not keep_tasks:
+            self.tasks.clear()
         self.tasks.set_header("准备中…", show_stop=True)
         self._relayout_tasks()
         self._log(f"—— 开始：{label} ——")
-
-        def _done(_: Any = None) -> None:
-            self._set_busy_ui(False)
-            if not self.tasks.lbl_title.cget("text").startswith("完成") and not self.tasks.lbl_title.cget("text").startswith("已停止"):
-                self._refresh_task_header(done=True)
-
-        def _err(exc: BaseException) -> None:
-            self._set_busy_ui(False)
-            msg = explain_error(exc)
-            self._log(msg, error=True)
-            self.tasks.set_header("失败", show_stop=False)
-            messagebox.showerror(APP_NAME, msg)
-
-        self._run_async(coro, on_done=_done, on_error=_err)
+        self._run_async(coro, on_done=self._on_task_done, on_error=self._on_task_error)
 
     def _request_stop(self) -> None:
         self._stop_flag.set()
-        self._log("正在停止…当前文件会尽快中断。未下完的临时文件会被删除（Telegram 暂不支持可靠续传）。")
+        self._log("正在暂停…当前文件会尽快中断。未下完的临时文件会被删除（Telegram 暂不支持可靠续传）。")
 
     # --------------------------------------------------------------- async
     def _run_async(
@@ -4326,20 +5663,24 @@ class App(tk.Tk):
         self._log("刷新对话列表…")
         self._run_async(self._async_reload_dialogs_only(), on_error=self._show_error)
 
+    def _apply_dpi_window(self) -> None:
+        scale = float(getattr(Fonts, "scale", 1.0) or 1.0)
+        if scale <= 1.01:
+            return
+        self.geometry(f"{ui_px(WINDOW_W)}x{ui_px(WINDOW_H)}")
+        self.minsize(ui_px(WINDOW_MIN_W), ui_px(WINDOW_MIN_H))
+
     def _on_window_map(self, event: tk.Event) -> None:
         if event.widget is self:
             apply_window_icon(self, self._icon_photos)
+            if getattr(self, "_want_borderless_on_restore", False):
+                self.after_idle(self._restore_borderless_chrome)
 
     def _on_window_unmap(self, event: tk.Event) -> None:
+        # iconify unmaps the window. That is a taskbar minimize.
+        # Withdrawing into the tray happens only from the close button.
         if event.widget is not self:
             return
-        if getattr(self, "_exiting", False) or getattr(self, "_hiding_to_tray", False):
-            return
-        try:
-            if self.state() == "iconic":
-                self._hide_to_tray()
-        except Exception:
-            pass
 
     def _start_tray(self) -> None:
         if getattr(self, "_tray", None) is not None:
@@ -4352,6 +5693,8 @@ class App(tk.Tk):
             return
         try:
             menu = pystray.Menu(
+                pystray.MenuItem(APP_NAME, None, enabled=False),
+                pystray.Menu.SEPARATOR,
                 pystray.MenuItem("打开主窗口", self._tray_show, default=True),
                 pystray.MenuItem("退出", self._tray_exit),
             )
@@ -4382,6 +5725,12 @@ class App(tk.Tk):
                 self.state("normal")
             except Exception:
                 pass
+            if self._borderless:
+                try:
+                    self.overrideredirect(True)
+                except Exception:
+                    pass
+                self._win_taskbar_and_mica()
             self.lift()
             self.focus_force()
             apply_window_icon(self, self._icon_photos)
@@ -4413,7 +5762,7 @@ class App(tk.Tk):
         if not self._tray_hint_shown:
             self._tray_hint_shown = True
             try:
-                self._tray.notify("已最小化到托盘，点击图标可重新打开。", APP_NAME)
+                self._tray.notify("已关闭到托盘，点击图标可重新打开。", APP_NAME)
             except Exception:
                 pass
 
@@ -4428,8 +5777,9 @@ class App(tk.Tk):
             pass
 
     def _on_close(self) -> None:
-        # 点窗口关闭：缩到托盘，下载任务继续跑
-        self._hide_to_tray()
+        # 点窗口关闭：收到托盘，下载继续。最小化走任务栏，不进这里。
+        if chrome_action("close") == "tray":
+            self._hide_to_tray()
 
     def _quit_app(self) -> None:
         if getattr(self, "_exiting", False):
@@ -4443,6 +5793,10 @@ class App(tk.Tk):
             if not messagebox.askyesno(APP_NAME, "还有下载任务在进行。确定要退出吗？未下完的文件不会保留。"):
                 return
         self._exiting = True
+        try:
+            self.queue.prepare_for_exit()
+        except Exception:
+            pass
         self._stop_tray()
         self._stop_flag.set()
         # 先立刻隐去窗口，并用看门狗保证进程一定退出，避免安装包仍检测到残留进程
@@ -4506,6 +5860,7 @@ class App(tk.Tk):
 
 
 def main() -> None:
+    enable_windows_dpi_awareness()
     if sys.platform == "win32":
         try:
             sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
