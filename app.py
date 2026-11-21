@@ -677,6 +677,85 @@ def chat_download_action(busy: bool) -> str:
     return "enqueue" if busy else "start"
 
 
+def select_all_mark(visible_count: int, visible_selected: int) -> str:
+    """Header checkbox for the videos currently on screen."""
+    if visible_count > 0 and visible_selected >= visible_count:
+        return "on"
+    if visible_selected > 0:
+        return "mid"
+    return "off"
+
+
+def picked_count_text(count: int, chat_count: int) -> str:
+    """「已选」 covers every channel, and says so when more than one is involved."""
+    if chat_count > 1:
+        return f"已选 {count} · {chat_count} 个对话"
+    return f"已选 {count}"
+
+
+class CrossChatSelection:
+    """Checked videos remembered by (chat id, message id).
+
+    The on-screen list is rebuilt when the user opens another channel.
+    「已选」 and 「下载选中」 read this store, so those checks stay put.
+    """
+
+    def __init__(self) -> None:
+        self._items: dict[tuple[Any, int], tuple[DialogItem, VideoItem]] = {}
+        self._chat_order: list[Any] = []
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    @property
+    def chat_count(self) -> int:
+        return len({chat_id for chat_id, _message_id in self._items})
+
+    def clear(self) -> None:
+        self._items.clear()
+        self._chat_order.clear()
+
+    def ids_for(self, chat_id: Any) -> set[int]:
+        return {message_id for cid, message_id in self._items if cid == chat_id}
+
+    def set_checked(self, chat: DialogItem, item: VideoItem, checked: bool) -> None:
+        key = (chat.id, int(item.message_id))
+        if not checked:
+            self._items.pop(key, None)
+            if not self.ids_for(chat.id):
+                self._chat_order = [cid for cid in self._chat_order if cid != chat.id]
+            return
+        if chat.id not in self._chat_order:
+            self._chat_order.append(chat.id)
+        self._items[key] = (chat, item)
+
+    def set_many(self, chat: DialogItem, items: Iterable[VideoItem], checked: bool) -> None:
+        for item in items:
+            self.set_checked(chat, item, checked)
+
+    def refresh(self, chat: DialogItem, items: Iterable[VideoItem]) -> None:
+        """Keep the latest message object when this channel is loaded again."""
+        for item in items:
+            key = (chat.id, int(item.message_id))
+            if key in self._items:
+                self._items[key] = (chat, item)
+
+    def download_batches(self, current_chat_id: Any = None) -> list[tuple[DialogItem, list[Any]]]:
+        """One batch per chat. The open chat goes first; inside a chat, newer messages first."""
+        order = [cid for cid in self._chat_order if self.ids_for(cid)]
+        if current_chat_id in order:
+            order.remove(current_chat_id)
+            order.insert(0, current_chat_id)
+        batches: list[tuple[DialogItem, list[Any]]] = []
+        for cid in order:
+            rows = [self._items[key] for key in self._items if key[0] == cid]
+            rows.sort(key=lambda row: int(row[1].message_id), reverse=True)
+            messages = [item.message for _chat, item in rows if item.message is not None]
+            if messages:
+                batches.append((rows[0][0], messages))
+        return batches
+
+
 def merge_queue_keys(seed_keys: Iterable[str], preserved_keys: Iterable[str]) -> list[str]:
     """Keep videos queued while a batch is starting, without duplicating keys."""
     order: list[str] = []
@@ -2384,13 +2463,21 @@ class VideoList(tk.Frame):
         self.scroll.reset_top()
 
     def set_items(self, items: list[VideoItem], selected: Optional[set[int]] = None, reset_scroll: bool = True) -> None:
+        kept = {int(mid) for mid in selected} if selected is not None else set()
         self.clear()
-        if selected:
-            self._selected = set(selected)
+        self._selected = kept
         for i, item in enumerate(items):
             self._append_row(item, divider=i > 0)
         if reset_scroll:
             self.scroll.reset_top()
+
+    def remember_selected(self, message_ids: Iterable[int]) -> None:
+        """Keep checks for messages that are not on screen yet, and paint the ones that are."""
+        self._selected.update(int(mid) for mid in message_ids)
+        for mid, row in self._rows.items():
+            want = mid in self._selected
+            if row.selected != want:
+                row.set_selected(want)
 
     def append_items(self, items: list[VideoItem]) -> None:
         start = len(self._order)
@@ -2422,9 +2509,19 @@ class VideoList(tk.Frame):
         self._on_toggle(item)
 
     def set_all_selected(self, selected: bool) -> None:
-        self._selected = set(self._order) if selected else set()
+        # Only the rows on screen. Checks for videos not loaded yet stay remembered.
+        if selected:
+            self._selected.update(self._order)
+        else:
+            self._selected.difference_update(self._order)
         for mid, row in self._rows.items():
             row.set_selected(mid in self._selected)
+
+    def clear_checks(self) -> None:
+        self._selected.clear()
+        for row in self._rows.values():
+            if row.selected:
+                row.set_selected(False)
 
     def update_thumb(self, message_id: int, data: bytes) -> None:
         row = self._rows.get(message_id)
@@ -2440,7 +2537,7 @@ class VideoList(tk.Frame):
         return set(self._selected)
 
     def all_selected(self) -> bool:
-        return bool(self._order) and len(self._selected) == len(self._order)
+        return bool(self._order) and set(self._order) <= self._selected
 
     def refresh_quality(self, pref: str) -> None:
         for row in self._rows.values():
@@ -3167,6 +3264,7 @@ class App(tk.Tk):
         self._selected_dialog: Optional[DialogItem] = None
         self._video_chat: Optional[DialogItem] = None
         self._video_items: list[VideoItem] = []
+        self._picked = CrossChatSelection()
         self._video_gen = 0
         self._video_loading = False
         self._video_has_more = False
@@ -3706,7 +3804,7 @@ class App(tk.Tk):
         self.lbl_video_empty.pack(pady=(10, 0))
         self.video_empty.place(relx=0.5, rely=0.5, anchor="center")
 
-        self.video_list = VideoList(self.video_body, on_toggle=lambda _item: self._sync_chat_actions())
+        self.video_list = VideoList(self.video_body, on_toggle=self._on_video_toggle)
 
         foot = tk.Frame(right, bg=C_FOOT, height=44)
         self.video_footer = foot
@@ -3761,15 +3859,12 @@ class App(tk.Tk):
         if not hasattr(self, "btn_dl_selected"):
             return
         has_items = bool(self._video_items)
-        selected_n = len(self.video_list.selected_ids) if has_items else 0
+        visible_ids = {v.message_id for v in self._video_items}
+        visible_selected = len(visible_ids & self.video_list.selected_ids) if has_items else 0
+        selected_n = len(self._picked)
         can_fetch = bool(self._logged_in and not self._busy)
         can_download = bool(self._logged_in and selected_n)
-        if has_items and selected_n == len(self._video_items):
-            self.chk_select_all.set_state("on")
-        elif selected_n:
-            self.chk_select_all.set_state("mid")
-        else:
-            self.chk_select_all.set_state("off")
+        self.chk_select_all.set_state(select_all_mark(len(self._video_items), visible_selected))
         self.chk_select_all.set_enabled(has_items)
         if self._video_chat is not None and not (self._video_loading and not has_items):
             note_n = len(getattr(self, "_video_notices", []) or [])
@@ -3781,14 +3876,31 @@ class App(tk.Tk):
             self.lbl_video_count.configure(text="")
         more_ok = can_fetch and self._video_chat is not None and self._video_has_more and not self._video_loading
         self.btn_load_more.set_state("normal" if more_ok else "disabled")
-        self.lbl_picked.configure(text=f"已选 {selected_n}")
+        self.lbl_picked.configure(text=picked_count_text(selected_n, self._picked.chat_count))
         self.btn_dl_selected.set_state("normal" if can_download else "disabled")
 
-    def _toggle_select_all(self) -> None:
-        if not self._video_items:
-            return
-        self.video_list.set_all_selected(not self.video_list.all_selected())
+    def _on_video_toggle(self, item: VideoItem) -> None:
+        chat = self._video_chat
+        if chat is not None:
+            self._picked.set_checked(chat, item, item.message_id in self.video_list.selected_ids)
         self._sync_chat_actions()
+
+    def _toggle_select_all(self) -> None:
+        if not self._video_items or self._video_chat is None:
+            return
+        select = not self.video_list.all_selected()
+        self.video_list.set_all_selected(select)
+        self._picked.set_many(self._video_chat, self._video_items, select)
+        self._sync_chat_actions()
+
+    def _remember_loaded_checks(self, chat: DialogItem) -> set[int]:
+        self._picked.refresh(chat, self._video_items)
+        return self._picked.ids_for(chat.id)
+
+    def _selected_download_batches(self) -> list[tuple[DialogItem, list[Any]]]:
+        current = self._video_chat or self._selected_dialog
+        chat_id = current.id if current is not None else None
+        return self._picked.download_batches(chat_id)
 
     def _quality_pref(self) -> str:
         return quality_pref_value(self.var_quality.get())
@@ -3926,6 +4038,12 @@ class App(tk.Tk):
         self._account_name = name or self._account_name
         self._refresh_account_bar()
         if not logged_in:
+            picked = getattr(self, "_picked", None)
+            if picked is not None:
+                picked.clear()
+            listing = getattr(self, "video_list", None)
+            if listing is not None:
+                listing.clear_checks()
             self.btn_dl_link.set_state("disabled")
         elif not self._busy:
             self.btn_dl_link.set_state("normal")
@@ -5125,12 +5243,13 @@ class App(tk.Tk):
             self._log(note)
         if not self._video_items:
             self._video_items = list(videos)
+            checks = self._remember_loaded_checks(item)
             if not videos:
                 self._show_video_empty(
                     "\n".join(page.notices[:4]) if page.notices else "这个对话里没有可下载的视频"
                 )
             else:
-                self.video_list.set_items(self._video_items)
+                self.video_list.set_items(self._video_items, selected=checks)
                 self._show_video_list()
         else:
             existing = {v.message_id for v in self._video_items}
@@ -5140,11 +5259,12 @@ class App(tk.Tk):
                 self._video_items.sort(key=lambda v: v.message_id, reverse=True)
                 self.video_list.set_items(
                     self._video_items,
-                    selected=self.video_list.selected_ids,
+                    selected=self._remember_loaded_checks(item),
                     reset_scroll=False,
                 )
             else:
                 self._video_items.extend(added)
+                self.video_list.remember_selected(self._remember_loaded_checks(item))
                 if added:
                     self.video_list.append_items(added)
             if self._video_items:
@@ -5204,7 +5324,9 @@ class App(tk.Tk):
                 document_id=primary_document_id(msg),
             )
 
-    def _enqueue_chat_download(self, item: DialogItem, messages: list[Any], folder: Path) -> None:
+    def _enqueue_chat_download(
+        self, item: DialogItem, messages: list[Any], folder: Path, *, notify: bool = True
+    ) -> None:
         """Queue more chat videos without clearing the download that is running."""
         self._task_gen += 1
         gen = self._task_gen
@@ -5220,33 +5342,10 @@ class App(tk.Tk):
             self.tasks.upsert(key, name, status, total=total)
         self._refresh_task_header()
         self._log(f"已加入 {len(messages)} 个视频，会在当前任务后继续下载。")
-        self._fly_task_to_links(len(messages))
+        if notify:
+            self._fly_task_to_links(len(messages))
 
-    def _on_download_selected(self) -> None:
-        if self._busy and self._stop_flag.is_set():
-            messagebox.showinfo(APP_NAME, "正在暂停，请稍候再开始新的下载。")
-            return
-        item = self._video_chat or self._selected_dialog
-        if not item:
-            messagebox.showwarning(APP_NAME, "请先选择一个对话。")
-            return
-        chosen_ids = self.video_list.selected_ids
-        messages = [v.message for v in self._video_items if v.message_id in chosen_ids and v.message is not None]
-        # 保持当前列表顺序（新到旧）
-        if not messages:
-            messagebox.showwarning(APP_NAME, "请先勾选要下载的视频。")
-            return
-        try:
-            folder = self._save_folder()
-        except Exception as exc:
-            messagebox.showerror(APP_NAME, explain_error(exc))
-            return
-        if not self.service:
-            messagebox.showwarning(APP_NAME, "尚未连接，请先完成登录。")
-            return
-        if chat_download_action(self._busy) == "enqueue":
-            self._enqueue_chat_download(item, messages, folder)
-            return
+    def _begin_chat_download(self, item: DialogItem, messages: list[Any], folder: Path) -> None:
         self._task_gen += 1
         gen = self._task_gen
         title = item.title or ""
@@ -5258,7 +5357,34 @@ class App(tk.Tk):
             label="对话下载",
             keep_tasks=True,
         )
-        self._fly_task_to_links(len(messages))
+
+    def _on_download_selected(self) -> None:
+        if self._busy and self._stop_flag.is_set():
+            messagebox.showinfo(APP_NAME, "正在暂停，请稍候再开始新的下载。")
+            return
+        batches = self._selected_download_batches()
+        if not batches:
+            messagebox.showwarning(APP_NAME, "请先勾选要下载的视频。")
+            return
+        try:
+            folder = self._save_folder()
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, explain_error(exc))
+            return
+        if not self.service:
+            messagebox.showwarning(APP_NAME, "尚未连接，请先完成登录。")
+            return
+        total = sum(len(messages) for _item, messages in batches)
+        if chat_download_action(self._busy) == "enqueue":
+            for item, messages in batches:
+                self._enqueue_chat_download(item, messages, folder, notify=False)
+            self._fly_task_to_links(total)
+            return
+        item, messages = batches[0]
+        self._begin_chat_download(item, messages, folder)
+        for item, messages in batches[1:]:
+            self._enqueue_chat_download(item, messages, folder, notify=False)
+        self._fly_task_to_links(total)
 
     async def _async_download_selected(
         self,
