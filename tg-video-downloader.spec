@@ -64,4 +64,5 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=False,
     icon=ICON,
+    manifest=str(SPEC_DIR / "app.manifest"),
 )
