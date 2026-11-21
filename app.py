@@ -3,13 +3,50 @@
 
 from __future__ import annotations
 
+import sys
+
+
+def enable_windows_dpi_awareness() -> str:
+    """Stop Windows from bitmap-stretching a Tk window.
+
+    This has to run before Tk is imported. On a scaled display, a DPI-unaware
+    process is stretched as a bitmap, which is why text and icons look soft.
+    Returns the mode that was set, or "" when this is not Windows or awareness
+    was already chosen (for example by the exe manifest).
+    """
+    if sys.platform != "win32":
+        return ""
+    import ctypes
+
+    try:
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return "per-monitor-v2"
+    except Exception:
+        pass
+    try:
+        # PROCESS_PER_MONITOR_DPI_AWARE = 2
+        if int(ctypes.windll.shcore.SetProcessDpiAwareness(2)) == 0:
+            return "per-monitor"
+    except Exception:
+        pass
+    try:
+        if ctypes.windll.user32.SetProcessDPIAware():
+            return "system"
+    except Exception:
+        pass
+    return ""
+
+
+# Before Tk loads, otherwise the process stays DPI-unaware and Windows blurs the whole window.
+enable_windows_dpi_awareness()
+
 import asyncio
 import io
 import math
 import os
 import queue
 import subprocess
-import sys
 import threading
 import time
 import traceback
@@ -42,6 +79,7 @@ from tgcore import (
     clear_credentials,
     clear_session_only,
     detect_local_proxies,
+    dialog_kind_counts,
     DOWNLOAD_INDEX_PATH,
     QUEUE_PATH,
     DownloadQueue,
@@ -117,8 +155,8 @@ AVATAR_COLORS = ("#5B7C99", "#6B8F71", "#8A6D4A", "#7A6B99", "#6A7A8A")
 
 WINDOW_W = 960
 WINDOW_H = 680
-WINDOW_MIN_W = 760
-WINDOW_MIN_H = 560
+WINDOW_MIN_W = 900
+WINDOW_MIN_H = 620
 RAIL_W = 68
 TITLE_H = 40
 CTRL_H = 32
@@ -194,7 +232,7 @@ def task_row_status_text(
     if status == "queued":
         return "排队中"
     if status == "error":
-        return error or "失败"
+        return short_failure_reason(error)
     if speed:
         return format_speed(speed)
     return "下载中"
@@ -497,33 +535,30 @@ def _set_win_relaunch_props(win: tk.Misc, ico: Path) -> None:
 def _tray_image():
     from PIL import Image as _Image
 
-    path = resource_path("app-icon.ico", "app-icon-64.png", "app-icon-256.png")
+    # Downscale the large master so the tray icon stays sharp when Windows scales it.
+    path = resource_path("app-icon-256.png", "app-icon.ico", "app-icon-64.png")
     if path is None:
-        return _Image.new("RGBA", (32, 32), (0, 95, 184, 255))
-    img = _Image.open(path)
-    best = None
-    try:
-        index = 0
-        while True:
-            try:
-                img.seek(index)
-            except EOFError:
-                break
-            frame = img.copy()
-            if frame.size == (32, 32):
-                best = frame
-                break
-            if best is None or abs(frame.size[0] - 32) < abs(best.size[0] - 32):
-                best = frame
-            index += 1
-    except Exception:
-        best = img
-    chosen = best or img
-    if chosen.mode != "RGBA":
-        chosen = chosen.convert("RGBA")
-    if chosen.size != (32, 32):
-        chosen = chosen.resize((32, 32), _Image.Resampling.LANCZOS)
-    return chosen
+        return _Image.new("RGBA", (32, 32), (0, 168, 168, 255))
+    img = _Image.open(path).convert("RGBA")
+    if getattr(img, "n_frames", 1) > 1:
+        best = None
+        try:
+            index = 0
+            while True:
+                try:
+                    img.seek(index)
+                except EOFError:
+                    break
+                frame = img.copy()
+                if best is None or frame.size[0] > best.size[0]:
+                    best = frame
+                index += 1
+        except Exception:
+            best = img
+        img = (best or img).convert("RGBA")
+    if img.size != (64, 64):
+        img = img.resize((64, 64), _Image.Resampling.LANCZOS)
+    return img
 
 
 def set_app_user_model_id(app_id: str = APP_USER_MODEL_ID) -> None:
@@ -538,15 +573,14 @@ def set_app_user_model_id(app_id: str = APP_USER_MODEL_ID) -> None:
 
 
 def ui_scale(widget: Optional[tk.Misc] = None) -> float:
-    """Logical 1.0 at 96 DPI. Used so covers/avatars are not upscaled from tiny bitmaps."""
+    """Device pixels per design pixel. 1.0 at 96 DPI.
+
+    Tk's own scaling is pinned at 96 DPI so it does not stretch pixel widgets a
+    second time. Bitmaps use this ratio and are rasterized at device size.
+    """
+    del widget
     try:
-        target = widget
-        if target is None:
-            target = tk._get_default_root()  # type: ignore[attr-defined]
-        if target is None:
-            return 1.0
-        scaling = float(target.tk.call("tk", "scaling"))
-        return max(1.0, scaling / (96.0 / 72.0))
+        return max(1.0, float(getattr(Fonts, "scale", 1.0) or 1.0))
     except Exception:
         return 1.0
 
@@ -590,59 +624,62 @@ def choose_ui_font(families: Iterable[str]) -> str:
     return "TkDefaultFont"
 
 
-def enable_windows_dpi_awareness() -> str:
-    """Stop Windows from bitmap-stretching a Tk window.
+def read_monitor_dpi(root: tk.Misc) -> float:
+    """OS DPI, not Tk's scaling. Reading ``1i`` after changing scaling compounds."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
 
-    On a scaled display, a DPI-unaware process is stretched as a bitmap, which
-    is the usual reason Tk text looks fuzzy. This has to run before the first
-    window. Returns the mode that was set, or "" when this is not Windows or
-    awareness was already chosen (for example by the exe manifest).
-    """
-    if sys.platform != "win32":
-        return ""
-    import ctypes
-
+            user32 = ctypes.windll.user32
+            user32.GetDpiForWindow.restype = ctypes.c_uint
+            user32.GetDpiForWindow.argtypes = [ctypes.c_void_p]
+            hwnd = int(root.winfo_id())
+            dpi = int(user32.GetDpiForWindow(hwnd) or 0)
+            if dpi >= 96:
+                return float(dpi)
+            user32.GetDpiForSystem.restype = ctypes.c_uint
+            dpi = int(user32.GetDpiForSystem() or 0)
+            if dpi >= 96:
+                return float(dpi)
+        except Exception:
+            pass
     try:
-        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
-        if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
-            return "per-monitor-v2"
+        return float(root.winfo_fpixels("1i"))
     except Exception:
-        pass
-    try:
-        # PROCESS_PER_MONITOR_DPI_AWARE = 2
-        if int(ctypes.windll.shcore.SetProcessDpiAwareness(2)) == 0:
-            return "per-monitor"
-    except Exception:
-        pass
-    try:
-        if ctypes.windll.user32.SetProcessDPIAware():
-            return "system"
-    except Exception:
-        pass
-    return ""
+        return 96.0
 
 
 def apply_tk_dpi_scaling(root: tk.Misc) -> float:
-    """Point Tk at the real monitor DPI so it does not paint at 96 and scale up.
+    """One scale factor, applied by us. Tk itself stays on a 96 DPI pixel grid.
 
-    Returns the ratio versus 96 DPI. Values within 5% of 1 stay exactly 1 so a
-    normal 96 DPI desktop keeps the designed pixel layout.
+    Setting ``tk scaling`` to the real DPI *and* multiplying the window by that
+    same ratio makes the window grow twice and softens bitmaps. Pin scaling at
+    96/72 so a 960×680 design stays 960×680 at 100%, and exactly ``scale`` times
+    that — once — on a high-DPI monitor. Fonts use negative pixel sizes at that
+    one factor, so GDI rasterizes them sharp instead of stretching a bitmap.
     """
-    try:
-        ppi = float(root.winfo_fpixels("1i"))
-    except Exception:
-        ppi = 96.0
-    if ppi < 48 or ppi > 800:
-        ppi = 96.0
-    scale = ppi / 96.0
+    dpi = read_monitor_dpi(root)
+    if dpi < 48 or dpi > 800:
+        dpi = 96.0
+    scale = dpi / 96.0
     if abs(scale - 1.0) < 0.05:
         scale = 1.0
-        ppi = 96.0
     try:
-        root.tk.call("tk", "scaling", ppi / 72.0)
+        root.tk.call("tk", "scaling", 96.0 / 72.0)
     except Exception:
         pass
     return scale
+
+
+def window_size_for_scale(scale: float) -> tuple[int, int]:
+    """Design size times one scale. 1.0 is exactly 960×680, not 960×scale×scale."""
+    factor = 1.0 if abs(float(scale) - 1.0) < 0.05 else max(1.0, float(scale))
+    return sharp_px(WINDOW_W, factor), sharp_px(WINDOW_H, factor)
+
+
+def min_window_for_scale(scale: float) -> tuple[int, int]:
+    factor = 1.0 if abs(float(scale) - 1.0) < 0.05 else max(1.0, float(scale))
+    return sharp_px(WINDOW_MIN_W, factor), sharp_px(WINDOW_MIN_H, factor)
 
 
 def sharp_px(logical: int, scale: float = 1.0) -> int:
@@ -746,10 +783,95 @@ def preferred_media_size(msg: Any, pref: Optional[str] = None) -> Optional[int]:
     return message_file_size(msg)
 
 def task_display_name(msg: Any, chat_title: str) -> str:
-    original = original_media_name(msg)
-    if original:
-        return Path(original).name
-    return build_save_name(msg, chat_title)
+    from tgcore import message_caption_line, readable_task_title
+
+    return readable_task_title(
+        message_caption_line(msg),
+        chat_title,
+        getattr(msg, "id", 0),
+        original_media_name(msg),
+    )
+
+
+def short_failure_reason(error: str) -> str:
+    """任务行上的失败原因。完整句子仍写在日志里。"""
+    text = (error or "").strip()
+    if not text:
+        return "失败"
+    for sep in ("：", ":"):
+        if sep in text:
+            tail = text.split(sep, 1)[1].strip()
+            if tail:
+                text = tail
+                break
+    text = " ".join(text.split())
+    if len(text) > 72:
+        text = text[:71].rstrip() + "…"
+    return text or "失败"
+
+
+def scan_progress_text(
+    found: int,
+    has_more: bool,
+    scanning: bool = False,
+    seen: int = 0,
+    total: int = 0,
+) -> str:
+    """列表底部的扫描提示。没有总数时不编造百分比。"""
+    found = max(0, int(found or 0))
+    seen = max(0, int(seen or 0))
+    total = max(0, int(total or 0))
+    pct = 0
+    if total > 0 and seen > 0:
+        pct = min(99 if has_more or scanning else 100, int(seen * 100 / total))
+    if scanning:
+        if pct:
+            return f"正在扫描 {pct}% · 已找到 {found} 个视频"
+        return f"正在扫描… 已找到 {found} 个视频"
+    if has_more:
+        if pct:
+            return f"还有更多未扫描（约 {pct}%），点击继续加载"
+        return "还有更多未扫描，点击继续加载"
+    return ""
+
+
+def startup_shows_main_window(start_minimized: bool) -> bool:
+    """默认显示主窗口。只有勾了「启动时最小化到托盘」才进托盘。"""
+    return not bool(start_minimized)
+
+
+def download_status_text(active: int) -> str:
+    active = max(0, int(active or 0))
+    if active <= 0:
+        return "就绪"
+    return f"下载中 {active} 项"
+
+
+def middle_elide(font: Any, text: str, width: int) -> str:
+    """路径中间省略，头尾都还看得见。"""
+    if not text or width <= 0:
+        return text or ""
+    if not hasattr(font, "measure") or font.measure(text) <= width:
+        return text
+    ell = "…"
+    if font.measure(ell) >= width:
+        return ell
+    best = ell
+    lo, hi = 0, len(text)
+    while lo <= hi:
+        keep = (lo + hi) // 2
+        left = (keep + 1) // 2
+        right = keep // 2
+        if right:
+            candidate = text[:left] + ell + text[len(text) - right :]
+        else:
+            candidate = text[:left] + ell
+        if font.measure(candidate) <= width:
+            best = candidate
+            lo = keep + 1
+        else:
+            hi = keep - 1
+    return best
 
 
 def rounded_rect(canvas: tk.Canvas, x1: float, y1: float, x2: float, y2: float, r: float, **kwargs) -> int:
@@ -959,17 +1081,19 @@ class PlaceholderText(tk.Text):
         self.configure(fg=C_TEXT)
 
     def _on_focus_in(self, _event: tk.Event | None = None) -> None:
-        if self._showing:
-            self._hide_placeholder()
+        # 空着时继续显示占位，避免一聚焦提示就消失。
+        return None
 
     def _on_focus_out(self, _event: tk.Event | None = None) -> None:
         if not self.get_text():
             self._show_placeholder()
 
-    def _on_key(self, _event: tk.Event | None = None) -> None:
-        if self._showing and self.get("1.0", "end-1c") != self._placeholder:
-            self._showing = False
-            self.configure(fg=C_TEXT)
+    def _on_key(self, event: tk.Event | None = None) -> None:
+        if not self._showing or event is None:
+            return
+        char = getattr(event, "char", "") or ""
+        if char and char.isprintable():
+            self._hide_placeholder()
 
     def _on_paste(self, _event: tk.Event | None = None) -> None:
         if self._showing:
@@ -992,7 +1116,7 @@ class PlaceholderText(tk.Text):
 
 
 class Field(tk.Frame):
-    """白底描边输入容器，高度 32。"""
+    """白底描边输入容器。高度按设计像素，再乘一次 DPI，避免和按钮各缩一次。"""
 
     def __init__(self, master: tk.Misc, height: int = 32, **kwargs: Any) -> None:
         super().__init__(
@@ -1004,8 +1128,160 @@ class Field(tk.Frame):
             **kwargs,
         )
         if height:
-            self.configure(height=height)
+            self.configure(height=ui_px(height))
             self.pack_propagate(False)
+            self.grid_propagate(False)
+
+
+class HoverTip:
+    """悬停时显示完整文字。离开或点击即关掉，不挡住操作。"""
+
+    def __init__(self, widget: tk.Widget, text_of: Callable[[], str], wrap: int = 420) -> None:
+        self.widget = widget
+        self.text_of = text_of
+        self.wrap = wrap
+        self.tip: Optional[tk.Toplevel] = None
+        widget.bind("<Enter>", self._show, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<Button-1>", self._hide, add="+")
+
+    def _show(self, _event: tk.Event | None = None) -> None:
+        text = (self.text_of() or "").strip()
+        if not text:
+            self._hide()
+            return
+        self._hide()
+        tip = tk.Toplevel(self.widget)
+        tip.wm_overrideredirect(True)
+        try:
+            tip.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        tip.configure(bg=C_TEXT)
+        tk.Label(
+            tip,
+            text=text,
+            bg=C_TEXT,
+            fg="#FFFFFF",
+            font=Fonts.help,
+            padx=8,
+            pady=4,
+            justify="left",
+            wraplength=self.wrap,
+        ).pack()
+        tip.update_idletasks()
+        x = self.widget.winfo_rootx()
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        tip.geometry(f"+{int(x)}+{int(y)}")
+        self.tip = tip
+
+    def _hide(self, _event: tk.Event | None = None) -> None:
+        tip = self.tip
+        self.tip = None
+        if tip is not None:
+            try:
+                tip.destroy()
+            except tk.TclError:
+                pass
+
+
+class PathField(Field):
+    """保存路径：框内中间省略，悬停看全文，单击可改。"""
+
+    def __init__(self, master: tk.Misc, variable: tk.StringVar, height: int = 32) -> None:
+        super().__init__(master, height=height)
+        self._var = variable
+        self._editing = False
+        self.lbl = tk.Label(self, text="", bg=C_CARD, fg=C_TEXT, font=Fonts.help, anchor="w")
+        self.lbl.pack(fill="both", expand=True, padx=10)
+        self.entry = tk.Entry(
+            self,
+            textvariable=variable,
+            relief="flat",
+            bd=0,
+            bg=C_CARD,
+            fg=C_TEXT,
+            font=Fonts.help,
+            insertbackground=C_TEXT,
+            highlightthickness=0,
+        )
+        self.entry.bind("<FocusOut>", self._end_edit, add="+")
+        self.entry.bind("<Return>", self._end_edit, add="+")
+        self.lbl.bind("<Button-1>", self._begin_edit, add="+")
+        self.bind("<Configure>", self._fit, add="+")
+        variable.trace_add("write", lambda *_: self._fit())
+        HoverTip(self, variable.get)
+        self._fit()
+
+    def _fit(self, _event: tk.Event | None = None) -> None:
+        if self._editing:
+            return
+        width = max(24, int(self.winfo_width() or 0) - 24)
+        font = Fonts.help or Fonts.body
+        self.lbl.configure(text=middle_elide(font, self._var.get(), width))
+
+    def _begin_edit(self, _event: tk.Event | None = None) -> None:
+        if self._editing:
+            return
+        self._editing = True
+        self.lbl.pack_forget()
+        self.entry.pack(fill="both", expand=True, padx=8, pady=4)
+        self.entry.focus_set()
+        self.entry.icursor("end")
+
+    def _end_edit(self, _event: tk.Event | None = None) -> str | None:
+        if not self._editing:
+            return None
+        self._editing = False
+        self.entry.pack_forget()
+        self.lbl.pack(fill="both", expand=True, padx=10)
+        self._fit()
+        return "break"
+
+
+class Toast:
+    """底部短暂提示。不抢焦点，点一下或到时就消失。"""
+
+    def __init__(self, root: tk.Misc) -> None:
+        self.root = root
+        self._after: Optional[str] = None
+        self.frame = tk.Frame(root, bg=C_TEXT)
+        self.lbl = tk.Label(
+            self.frame,
+            text="",
+            bg=C_TEXT,
+            fg="#FFFFFF",
+            font=Fonts.help,
+            padx=14,
+            pady=8,
+            justify="left",
+        )
+        self.lbl.pack()
+        self.frame.bind("<Button-1>", lambda _e: self.hide())
+        self.lbl.bind("<Button-1>", lambda _e: self.hide())
+
+    def show(self, text: str, kind: str = "info") -> None:
+        message = (text or "").strip()
+        if not message:
+            return
+        bg = C_ERR if kind == "err" else C_TEXT
+        self.frame.configure(bg=bg)
+        self.lbl.configure(text=message, bg=bg, fg="#FFFFFF")
+        self.frame.place(relx=0.5, rely=1.0, y=-max(18, ui_px(52)), anchor="s")
+        self.frame.lift()
+        if self._after:
+            try:
+                self.root.after_cancel(self._after)
+            except Exception:
+                pass
+        self._after = self.root.after(2400, self.hide)
+
+    def hide(self) -> None:
+        self._after = None
+        try:
+            self.frame.place_forget()
+        except tk.TclError:
+            pass
 
 
 class FlatButton(tk.Canvas):
@@ -1063,6 +1339,10 @@ class FlatButton(tk.Canvas):
         tw = measure_font.measure(text) if hasattr(measure_font, "measure") else len(text) * 8
         self._width = self._min_width or max(tw + self._padx * 2, ui_px(64))
         self.configure(width=self._width, height=self._height)
+        self._redraw()
+
+    def set_variant(self, variant: str) -> None:
+        self._variant = variant if variant in ("primary", "secondary", "danger") else "secondary"
         self._redraw()
 
     def _on_enter(self, _event: tk.Event | None = None) -> None:
@@ -1753,15 +2033,12 @@ class ScrollArea(tk.Frame):
             return
         self._syncing = True
         try:
-            try:
-                self.inner.update_idletasks()
-            except tk.TclError:
-                return
             inner_h = max(0, int(self.inner.winfo_reqheight()))
             canvas_h = max(0, int(self.canvas.winfo_height()))
             canvas_w = max(0, int(self.canvas.winfo_width()))
             self.canvas.itemconfigure(self._win, width=max(1, canvas_w))
-            self.canvas.configure(scrollregion=(0, 0, max(1, canvas_w), inner_h))
+            # 底部多留一行，避免最后一条被裁切，滚不到日志栏上方。
+            self.canvas.configure(scrollregion=(0, 0, max(1, canvas_w), inner_h + 12))
             overflow = inner_h > canvas_h + 1 and canvas_h > 1
             if overflow != self._overflow:
                 self._overflow = overflow
@@ -1908,8 +2185,10 @@ class ChatRow(tk.Frame):
         self.av.pack(side="left", padx=(12, 10))
         self._draw_placeholder()
 
-        self.lbl_title = tk.Label(self, text=item.title, bg=C_CARD, fg=C_TEXT, font=Fonts.body, anchor="w")
+        self._title_full = item.title or ""
+        self.lbl_title = tk.Label(self, text=self._title_full, bg=C_CARD, fg=C_TEXT, font=Fonts.body, anchor="w")
         self.lbl_title.pack(side="left", fill="x", expand=True)
+        HoverTip(self.lbl_title, lambda: self._title_full)
 
         self.badge = tk.Label(
             self,
@@ -1924,7 +2203,13 @@ class ChatRow(tk.Frame):
 
         for w in (self, self.av, self.lbl_title, self.badge):
             w.bind("<Button-1>", self._click)
-        self.bind("<Configure>", self._rule)
+        self.bind("<Configure>", self._fit_title)
+
+    def _fit_title(self, _event: tk.Event | None = None) -> None:
+        badge_w = self.badge.winfo_reqwidth() if self.badge.winfo_exists() else 48
+        width = max(24, int(self.winfo_width() or 0) - self._av_size - badge_w - 48)
+        font = Fonts.body
+        self.lbl_title.configure(text=elide_text(font, self._title_full, width))
 
     def _draw_placeholder(self) -> None:
         bg = C_SEL if self.selected else C_CARD
@@ -2107,6 +2392,9 @@ def make_cover_photo(
         return None
 
 
+_PLACEHOLDER_COVERS: dict[tuple[int, int, int, int], ImageTk.PhotoImage] = {}
+
+
 def make_placeholder_photo(
     variant: int = 0,
     width: int = THUMB_W,
@@ -2118,6 +2406,10 @@ def make_placeholder_photo(
     width = scaled_px(width, widget)
     height = scaled_px(height, widget)
     radius = max(1, scaled_px(radius, widget))
+    key = (int(variant) % len(_PLACEHOLDER_COLORS), width, height, radius)
+    cached = _PLACEHOLDER_COVERS.get(key)
+    if cached is not None:
+        return cached
     c1, c2, motif = _PLACEHOLDER_COLORS[variant % len(_PLACEHOLDER_COLORS)]
     base = Image.new("RGB", (width, height))
     pix = base.load()
@@ -2154,7 +2446,9 @@ def make_placeholder_photo(
         fill=(255, 255, 255, 82),
     )
     img.putalpha(_rounded_mask(width, height, radius))
-    return ImageTk.PhotoImage(img)
+    photo = ImageTk.PhotoImage(img)
+    _PLACEHOLDER_COVERS[key] = photo
+    return photo
 
 
 class CheckMark(tk.Canvas):
@@ -2268,6 +2562,7 @@ class VideoRow(tk.Frame):
             justify="left",
         )
         self.lbl_title.pack(side="left", fill="x", expand=True)
+        HoverTip(self.lbl_title, lambda: self._title_full)
         self.lbl_meta = tk.Label(
             mid, text="", bg=C_CARD, fg=C_TEXT3, font=Fonts.aux, anchor="w", justify="left", wraplength=420
         )
@@ -2374,6 +2669,26 @@ class VideoList(tk.Frame):
         self._selected: set[int] = set()
         self.scroll = ScrollArea(self, bg=C_CARD)
         self.scroll.pack(fill="both", expand=True)
+        self._more = tk.Label(
+            self.scroll.inner,
+            text="",
+            bg="#FFF6E8",
+            fg="#8A5A00",
+            font=Fonts.help,
+            anchor="w",
+            justify="left",
+            padx=12,
+            pady=8,
+        )
+
+    def set_more_prompt(self, text: str) -> None:
+        message = (text or "").strip()
+        if geometry_managed(self._more):
+            self._more.pack_forget()
+        if not message:
+            return
+        self._more.configure(text=message)
+        self._more.pack(fill="x", pady=(4, 0))
 
     def clear(self) -> None:
         for row in self._rows.values():
@@ -2533,8 +2848,10 @@ class TaskRow(tk.Frame):
         mid = tk.Frame(body, bg=C_CARD)
         mid.pack(fill="x", pady=(1, 0))
         self._mid = mid
-        self.lbl_sub = tk.Label(mid, text="", bg=C_CARD, fg=C_TEXT3, font=Fonts.aux, anchor="w")
+        self.lbl_sub = tk.Label(mid, text="", bg=C_CARD, fg=C_TEXT3, font=Fonts.aux, anchor="w", justify="left")
         self.lbl_sub.pack(side="left", fill="x", expand=True)
+        self._error_full = ""
+        HoverTip(self.lbl_sub, lambda: self._error_full)
         self.lbl_pct = tk.Label(mid, text="", bg=C_CARD, fg=C_TEXT2, font=Fonts.aux, anchor="e")
         self.lbl_pct.pack(side="right")
 
@@ -2552,6 +2869,7 @@ class TaskRow(tk.Frame):
         error: str = "",
     ) -> None:
         self._status = status
+        self._error_full = error if status == "error" else ""
         pct = int(current * 100 / total) if total else (100 if status == "done" else 0)
         pct = max(0, min(100, pct))
         sub = task_row_status_text(status, error, speed, total, current)
@@ -2598,9 +2916,10 @@ class TaskRow(tk.Frame):
             stat_text = stat
             pct_text = f"{pct}%"
         self._apply_bg(row_bg)
-        self.lbl_name.configure(text=name, fg=name_fg)
+        width = max(80, int(self._body.winfo_width() or 280) - 8)
+        self.lbl_name.configure(text=elide_text(Fonts.body, name, width), fg=name_fg)
         self.lbl_stat.configure(text=stat_text, fg=stat_fg)
-        self.lbl_sub.configure(text=sub, fg=sub_fg)
+        self.lbl_sub.configure(text=sub, fg=sub_fg, wraplength=max(120, width))
         self.lbl_pct.configure(text=pct_text, fg=pct_fg)
         self.icon.configure(image=make_task_icon(icon_kind, self))
         self._icon_ref = make_task_icon(icon_kind, self)
@@ -2738,7 +3057,7 @@ class TaskList(tk.Frame):
         self._pack_header_buttons()
 
     def _show_open(self, show: bool) -> None:
-        # 「打开文件夹」只留在窗口顶部「浏览」旁边。任务头不再放一颗。
+        # 「打开文件夹」在设置菜单里。任务头不再放一颗。
         _ = show
         self._open_wanted = False
         self._pack_header_buttons()
@@ -2894,7 +3213,7 @@ CHAT_FILTERS = ("全部", "频道", "群组", "私聊", "机器人")
 
 
 class FilterChipBar(tk.Canvas):
-    """Win11 segmented filter: light track, white chip on the selected item."""
+    """筛选条。选中项用强调色底、加粗字和底边，旁边是数量。"""
 
     def __init__(
         self,
@@ -2902,10 +3221,11 @@ class FilterChipBar(tk.Canvas):
         command: Optional[Callable[[str], None]] = None,
         bg: str = C_BG,
     ) -> None:
-        super().__init__(master, height=28, highlightthickness=0, bd=0, bg=bg, cursor="hand2")
+        super().__init__(master, height=ui_px(32), highlightthickness=0, bd=0, bg=bg, cursor="hand2")
         self._command = command
         self.value = "全部"
         self._outer = bg
+        self._counts: dict[str, int] = {}
         self.bind("<Configure>", lambda _e: self._redraw())
         self.bind("<Button-1>", self._on_click)
         self._redraw()
@@ -2914,6 +3234,10 @@ class FilterChipBar(tk.Canvas):
         if value not in CHAT_FILTERS:
             value = "全部"
         self.value = value
+        self._redraw()
+
+    def set_counts(self, counts: Optional[dict[str, int]]) -> None:
+        self._counts = dict(counts or {})
         self._redraw()
 
     def _pick(self, value: str) -> None:
@@ -2932,7 +3256,7 @@ class FilterChipBar(tk.Canvas):
     def _redraw(self) -> None:
         self.delete("all")
         width = max(8, int(self.winfo_width()) if self.winfo_width() > 1 else 220)
-        height = 28
+        height = ui_px(32)
         self.configure(bg=self._outer, height=height)
         rounded_rect(self, 0, 0, width, height, 6, fill=C_FILTER_TRACK, outline=C_FILTER_TRACK)
         slot = width / len(CHAT_FILTERS)
@@ -2940,16 +3264,20 @@ class FilterChipBar(tk.Canvas):
             x1 = i * slot + 2
             x2 = (i + 1) * slot - 2
             active = label == self.value
+            count = self._counts.get(label)
+            shown = f"{label} {count}" if isinstance(count, int) else label
             if active:
-                rounded_rect(self, x1, 2, x2, height - 2, 4, fill="#FFFFFF", outline="#FFFFFF")
-                fg, font = C_TEXT, Fonts.aux_bold or Fonts.nav_active
+                rounded_rect(self, x1, 2, x2, height - 2, 4, fill=C_SEL, outline=C_SEL)
+                self.create_rectangle(x1 + 8, height - 3, x2 - 8, height - 1, fill=C_ACCENT, outline=C_ACCENT)
+                fg, font = C_ACCENT, Fonts.aux_bold or Fonts.nav_active
             else:
                 fg, font = C_TEXT2, Fonts.aux
-            canvas_text(self, (x1 + x2) / 2, height / 2, text=label, fill=fg, font=font)
+            shown = elide_text(font, shown, max(8, int(x2 - x1) - 8))
+            canvas_text(self, (x1 + x2) / 2, height / 2 - 1, text=shown, fill=fg, font=font)
 
 
 class QualityPicker(tk.Frame):
-    """Compact 「清晰度  最高 ▾」 control. Dropdown only when multiple real heights exist."""
+    """「下载优先清晰度」。这是下载时优先选哪一档，不是筛列表。"""
 
     def __init__(
         self,
@@ -2964,7 +3292,7 @@ class QualityPicker(tk.Frame):
         self._bg = bg
         self._mode = "static"
         self._choices: list[str] = ["最高"]
-        self._lbl_title = tk.Label(self, text="清晰度", bg=bg, fg=C_TEXT2, font=Fonts.help)
+        self._lbl_title = tk.Label(self, text="下载优先清晰度", bg=bg, fg=C_TEXT2, font=Fonts.help)
         self._lbl_title.pack(side="left")
         self._lbl_static = tk.Label(self, text="最高", bg=bg, fg=C_TEXT, font=Fonts.help, anchor="w")
         self._box = tk.Canvas(self, width=52, height=24, highlightthickness=0, bd=0, bg=bg, cursor="hand2")
@@ -2982,19 +3310,20 @@ class QualityPicker(tk.Frame):
                     values.append(label)
             self._choices = values or ["最高"]
         if self._mode == "dropdown":
-            if self._lbl_static.winfo_ismapped():
+            # winfo_ismapped 在父级还没显示时是假的，会把静态「最高」和下拉一起留着。
+            if geometry_managed(self._lbl_static):
                 self._lbl_static.pack_forget()
-            if not self._box.winfo_ismapped():
+            if not geometry_managed(self._box):
                 self._box.pack(side="left", padx=(6, 0))
             current = quality_pref_label(self._var.get())
             if current not in self._choices:
                 current = "最高"
             self._draw_box(current)
         else:
-            if self._box.winfo_ismapped():
+            if geometry_managed(self._box):
                 self._box.pack_forget()
             self._lbl_static.configure(text=text or "最高")
-            if not self._lbl_static.winfo_ismapped():
+            if not geometry_managed(self._lbl_static):
                 self._lbl_static.pack(side="left", padx=(6, 0))
 
     def set_options(self, labels: list[str]) -> None:
@@ -3172,6 +3501,12 @@ class App(tk.Tk):
         self._video_has_more = False
         self._video_scan = VideoScanState()
         self._video_notices: list[str] = []
+        self._video_scanning_all = False
+        self._video_scan_cancel = False
+        self._video_seen = 0
+        self._video_total = 0
+        self._video_pages = 0
+        self._search_after: Optional[str] = None
         self._task_gen = 0
         self.queue = DownloadQueue(persist_path=QUEUE_PATH)
         self._phone_pending: Optional[str] = None
@@ -3190,6 +3525,7 @@ class App(tk.Tk):
         self._apply_dpi_window()
         self._build_style()
         self._build_ui()
+        self.toast = Toast(self)
         self._restore_unfinished_downloads()
         self._build_login_dialogs()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -3198,6 +3534,7 @@ class App(tk.Tk):
         self.after(80, self._drain_ui_queue)
         self.after(120, self._bootstrap)
         self.after(200, self._start_tray)
+        self.after(260, self._present_main_window)
 
     # ------------------------------------------------------------------ UI
     def _build_style(self) -> None:
@@ -3231,7 +3568,9 @@ class App(tk.Tk):
         self.settings_flyout = MenuFlyout(
             self,
             [
+                ("打开文件夹", self._open_folder, False),
                 ("代理", self._open_proxy, False),
+                ("启动时最小化到托盘", self._toggle_start_minimized, False),
                 ("关于", self._open_about, False),
             ],
         )
@@ -3277,13 +3616,14 @@ class App(tk.Tk):
         tk.Frame(self, bg=C_STROKE, height=1).grid(row=0, column=0, sticky="sew")
 
     def _load_title_icon(self) -> Optional[ImageTk.PhotoImage]:
-        png = resource_path("app-icon-64.png", "app-icon-256.png", "app-icon.ico")
+        png = resource_path("app-icon-256.png", "app-icon-64.png", "app-icon.ico")
         if png is None:
             return None
         try:
-            img = Image.open(png).convert("RGBA").resize((18, 18), Image.Resampling.LANCZOS)
-            mask = Image.new("L", (18, 18), 0)
-            ImageDraw.Draw(mask).rounded_rectangle((0, 0, 17, 17), radius=4, fill=255)
+            px = max(16, scaled_px(18, self))
+            img = Image.open(png).convert("RGBA").resize((px, px), Image.Resampling.LANCZOS)
+            mask = Image.new("L", (px, px), 0)
+            ImageDraw.Draw(mask).rounded_rectangle((0, 0, px - 1, px - 1), radius=max(3, px // 5), fill=255)
             img.putalpha(mask)
             self._title_icon_img = ImageTk.PhotoImage(img)
             return self._title_icon_img
@@ -3309,7 +3649,21 @@ class App(tk.Tk):
             self.settings_flyout.hide()
         else:
             self.account_flyout.hide()
+            self._sync_tray_menu_label()
             self.settings_flyout.popup(self.nav_settings, above=True)
+
+    def _sync_tray_menu_label(self) -> None:
+        rows = getattr(self.settings_flyout, "_rows", [])
+        if len(rows) < 3:
+            return
+        on = bool(self.cfg.get("start_minimized"))
+        rows[2].configure(text=("✓ 启动时最小化到托盘" if on else "启动时最小化到托盘"))
+
+    def _toggle_start_minimized(self) -> None:
+        enabled = not bool(self.cfg.get("start_minimized"))
+        self.cfg = update_config(start_minimized=enabled)
+        self._sync_tray_menu_label()
+        self._toast("已开启启动时最小化到托盘" if enabled else "启动时会显示主窗口")
 
     def _widget_is_under(self, widget: tk.Misc | None, parent: tk.Misc) -> bool:
         while widget is not None:
@@ -3394,9 +3748,34 @@ class App(tk.Tk):
             self._borderless = True
         except tk.TclError:
             self._borderless = False
+        else:
+            if sys.platform == "win32":
+                self._win_taskbar_and_mica()
+        # overrideredirect 在 Windows 上会把窗口卸掉，看起来像没启动、只剩托盘。
+        self._present_main_window()
+
+    def _present_main_window(self) -> None:
+        if not startup_shows_main_window(bool(self.cfg.get("start_minimized"))):
+            self.after(400, self._hide_to_tray)
             return
-        if sys.platform == "win32":
-            self._win_taskbar_and_mica()
+        try:
+            self.deiconify()
+            try:
+                self.state("normal")
+            except tk.TclError:
+                pass
+            self.lift()
+            self.attributes("-topmost", True)
+            self.after(180, self._drop_topmost)
+            self.focus_force()
+        except tk.TclError:
+            pass
+
+    def _drop_topmost(self) -> None:
+        try:
+            self.attributes("-topmost", False)
+        except tk.TclError:
+            pass
 
     def _toplevel_hwnd(self) -> int:
         self.update_idletasks()
@@ -3472,15 +3851,17 @@ class App(tk.Tk):
         dx = event.x_root - self._grip_x
         dy = event.y_root - self._grip_y
         nx, ny, nw, nh = x, y, w, h
+        min_w = int(getattr(self, "_min_w", WINDOW_MIN_W) or WINDOW_MIN_W)
+        min_h = int(getattr(self, "_min_h", WINDOW_MIN_H) or WINDOW_MIN_H)
         if "e" in edge:
-            nw = max(WINDOW_MIN_W, w + dx)
+            nw = max(min_w, w + dx)
         if "s" in edge:
-            nh = max(WINDOW_MIN_H, h + dy)
+            nh = max(min_h, h + dy)
         if "w" in edge:
-            nw = max(WINDOW_MIN_W, w - dx)
+            nw = max(min_w, w - dx)
             nx = x + (w - nw)
         if "n" in edge:
-            nh = max(WINDOW_MIN_H, h - dy)
+            nh = max(min_h, h - dy)
             ny = y + (h - nh)
         self.geometry(f"{int(nw)}x{int(nh)}+{int(nx)}+{int(ny)}")
 
@@ -3515,24 +3896,10 @@ class App(tk.Tk):
         tk.Label(path, text="保存到", bg=C_BG, fg=C_TEXT2, font=Fonts.help).grid(row=0, column=0, sticky="w")
         default_folder = self.cfg.get("last_save_folder") or str(DEFAULT_DOWNLOADS)
         self.var_folder = tk.StringVar(value=default_folder)
-        field = Field(path, height=32)
-        field.grid(row=0, column=1, sticky="ew", padx=(8, 8))
-        self.ent_folder = tk.Entry(
-            field,
-            textvariable=self.var_folder,
-            relief="flat",
-            bd=0,
-            bg=C_CARD,
-            fg=C_TEXT,
-            font=Fonts.help,
-            insertbackground=C_TEXT,
-            highlightthickness=0,
-        )
-        self.ent_folder.pack(fill="both", expand=True, padx=10, pady=6)
+        self.ent_folder = PathField(path, self.var_folder, height=32)
+        self.ent_folder.grid(row=0, column=1, sticky="ew", padx=(8, 8))
         self.btn_browse = FlatButton(path, "浏览", command=self._browse_folder, bg=C_BG)
-        self.btn_browse.grid(row=0, column=2, padx=(0, 8))
-        self.btn_open = FlatButton(path, "打开文件夹", command=self._open_folder, bg=C_BG)
-        self.btn_open.grid(row=0, column=3)
+        self.btn_browse.grid(row=0, column=2, sticky="e")
 
         self.page_host = tk.Frame(self.main, bg=C_BG)
         self.page_host.grid(row=1, column=0, sticky="nsew", padx=16, pady=(10, 0))
@@ -3551,26 +3918,33 @@ class App(tk.Tk):
         self.tasks.grid(row=2, column=0, sticky="nsew", padx=16, pady=(10, 0))
         self.main.rowconfigure(2, weight=1)
 
-        foot = tk.Frame(self.main, bg=C_BG, height=28)
-        foot.grid(row=3, column=0, sticky="ew", padx=16, pady=(10, 12))
-        foot.columnconfigure(1, weight=1)
-        self.lbl_ready = tk.Label(foot, text="就绪", bg=C_BG, fg=C_TEXT2, font=Fonts.help)
+        foot = tk.Frame(self.main, bg=C_BG, height=ui_px(28))
+        foot.grid(row=3, column=0, sticky="ew", padx=16, pady=(8, 10))
+        foot.grid_propagate(False)
+        foot.pack_propagate(False)
+        self.main.rowconfigure(3, weight=0, minsize=ui_px(28))
         self.btn_log = tk.Label(foot, text="▸ 日志", bg=C_BG, fg=C_TEXT2, font=Fonts.help, cursor="hand2")
         self.btn_log.pack(side="left")
         self.btn_log.bind("<Button-1>", lambda _e: self._toggle_log())
-        self.btn_clear_log = tk.Label(foot, text="清空", bg=C_BG, fg=C_ACCENT, font=Fonts.help, cursor="hand2")
+        self.btn_clear_log = tk.Label(foot, text="清空", bg=C_BG, fg=C_TEXT3, font=Fonts.help, cursor="hand2")
+        self.btn_clear_log.pack(side="left", padx=(12, 0))
         self.btn_clear_log.bind("<Button-1>", lambda _e: self._clear_log())
+        self.lbl_status = tk.Label(foot, text="就绪", bg=C_BG, fg=C_TEXT2, font=Fonts.help)
+        self.lbl_status.pack(side="left", padx=(16, 0))
 
         self.log_wrap = tk.Frame(
             self.main,
             bg=C_CARD,
+            height=ui_px(112),
             highlightthickness=1,
             highlightbackground=C_STROKE,
             highlightcolor=C_STROKE,
         )
+        self.log_wrap.pack_propagate(False)
+        self.log_wrap.grid_propagate(False)
         self.txt_log = tk.Text(
             self.log_wrap,
-            height=8,
+            height=4,
             wrap="word",
             state="disabled",
             relief="flat",
@@ -3603,7 +3977,7 @@ class App(tk.Tk):
         box.grid(row=0, column=0, sticky="nsew")
         self.txt_links = PlaceholderText(
             box,
-            placeholder="粘贴链接，一行一条",
+            placeholder="每行一条链接",
             font=Fonts.body,
             padx=10,
             pady=8,
@@ -3630,25 +4004,28 @@ class App(tk.Tk):
         left.columnconfigure(0, weight=1)
         left.rowconfigure(2, weight=1)
 
-        search = tk.Frame(left, bg=C_BG)
+        search_h = ui_px(32)
+        search = tk.Frame(left, bg=C_BG, height=search_h)
         search.grid(row=0, column=0, sticky="ew")
+        search.grid_propagate(False)
         search.columnconfigure(0, weight=1)
+        search.rowconfigure(0, minsize=search_h, weight=1)
         sfield = Field(search, height=32)
-        sfield.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        sfield.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         ic = tk.Canvas(sfield, width=14, height=14, highlightthickness=0, bd=0, bg=C_CARD)
         ic.pack(side="left", padx=(10, 0))
         draw_search_icon(ic, 0, 0, C_TEXT3, 14)
         self.var_search = tk.StringVar()
-        self.var_search.trace_add("write", lambda *_: self._refresh_chat_list())
+        self.var_search.trace_add("write", lambda *_: self._schedule_chat_refresh())
         self.ent_search = PlaceholderEntry(
             sfield,
             placeholder="搜索对话",
             textvariable=self.var_search,
             font=Fonts.body,
         )
-        self.ent_search.pack(side="left", fill="both", expand=True, padx=8, pady=6)
-        self.btn_refresh = FlatButton(search, "刷新", command=self._reload_dialogs, bg=C_BG)
-        self.btn_refresh.grid(row=0, column=1)
+        self.ent_search.pack(side="left", fill="both", expand=True, padx=8, pady=4)
+        self.btn_refresh = FlatButton(search, "刷新", command=self._reload_dialogs, bg=C_BG, height=32)
+        self.btn_refresh.grid(row=0, column=1, sticky="e")
 
         self.chat_filters = FilterChipBar(left, command=self._on_chat_filter, bg=C_BG)
         self.chat_filters.grid(row=1, column=0, sticky="ew", pady=(8, 0))
@@ -3666,6 +4043,7 @@ class App(tk.Tk):
         right.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
         right.columnconfigure(0, weight=1)
         right.rowconfigure(1, weight=1)
+        right.rowconfigure(2, weight=0)
         self.video_pane = right
 
         self.video_header = tk.Frame(right, bg=C_CARD, height=36)
@@ -3708,16 +4086,17 @@ class App(tk.Tk):
 
         self.video_list = VideoList(self.video_body, on_toggle=lambda _item: self._sync_chat_actions())
 
-        foot = tk.Frame(right, bg=C_FOOT, height=44)
+        foot = tk.Frame(right, bg=C_FOOT, height=ui_px(44))
         self.video_footer = foot
         foot.grid_propagate(False)
+        foot.pack_propagate(False)
         tk.Frame(foot, bg=C_STROKE, height=1).pack(fill="x")
         bar = tk.Frame(foot, bg=C_FOOT)
-        bar.pack(fill="both", expand=True, padx=12, pady=5)
-        self.btn_load_more = FlatButton(bar, "加载更多", command=self._on_load_more, bg=C_FOOT)
-        self.btn_load_more.pack(side="left")
+        bar.pack(fill="both", expand=True, padx=12)
+        self.btn_load_more = FlatButton(bar, "继续加载", command=self._on_load_more, bg=C_FOOT, height=28)
+        self.btn_scan_all = FlatButton(bar, "扫描全部", command=self._on_scan_all, bg=C_FOOT, height=28)
         self.btn_dl_selected = FlatButton(
-            bar, "下载选中", command=self._on_download_selected, variant="primary", bg=C_FOOT
+            bar, "下载选中", command=self._on_download_selected, variant="primary", bg=C_FOOT, height=28
         )
         self.btn_dl_selected.pack(side="right")
         self.lbl_picked = tk.Label(bar, text="已选 0", bg=C_FOOT, fg=C_TEXT2, font=Fonts.help)
@@ -3779,10 +4158,48 @@ class App(tk.Tk):
             self.lbl_video_count.configure(text=text)
         else:
             self.lbl_video_count.configure(text="")
+        scanning = bool(self._video_scanning_all and not self._video_scan_cancel)
         more_ok = can_fetch and self._video_chat is not None and self._video_has_more and not self._video_loading
-        self.btn_load_more.set_state("normal" if more_ok else "disabled")
+        prompt = scan_progress_text(
+            len(self._video_items),
+            bool(self._video_has_more),
+            scanning=scanning or bool(self._video_loading and self._video_chat is not None),
+            seen=self._video_seen,
+            total=self._video_total,
+        )
+        if hasattr(self, "video_list"):
+            self.video_list.set_more_prompt(prompt if self._video_chat is not None else "")
+        if scanning:
+            self.btn_load_more.set_text("扫描中")
+            self.btn_load_more.set_variant("primary")
+            self.btn_load_more.set_state("disabled")
+            self.btn_scan_all.set_text("停止扫描")
+            self.btn_scan_all.set_variant("secondary")
+            self.btn_scan_all.set_state("normal")
+        elif self._video_has_more and self._video_chat is not None:
+            self.btn_load_more.set_text("继续加载")
+            self.btn_load_more.set_variant("primary")
+            self.btn_load_more.set_state("normal" if more_ok else "disabled")
+            self.btn_scan_all.set_text("扫描全部")
+            self.btn_scan_all.set_variant("secondary")
+            self.btn_scan_all.set_state("normal" if can_fetch and not self._video_loading else "disabled")
+        else:
+            self.btn_load_more.set_text("加载更多")
+            self.btn_load_more.set_variant("secondary")
+            self.btn_load_more.set_state("disabled")
+            self.btn_scan_all.set_text("扫描全部")
+            self.btn_scan_all.set_state("disabled")
+        self._pack_scan_buttons(show=bool(self._video_chat is not None and (self._video_has_more or scanning)))
         self.lbl_picked.configure(text=f"已选 {selected_n}")
         self.btn_dl_selected.set_state("normal" if can_download else "disabled")
+
+    def _pack_scan_buttons(self, show: bool) -> None:
+        for button in (self.btn_scan_all, self.btn_load_more):
+            if show:
+                if not geometry_managed(button):
+                    button.pack(side="left", padx=(0, 8))
+            elif geometry_managed(button):
+                button.pack_forget()
 
     def _toggle_select_all(self) -> None:
         if not self._video_items:
@@ -3843,21 +4260,20 @@ class App(tk.Tk):
     def _relayout_tasks(self) -> None:
         on_links = self._page == "links"
         # 任务列表只出现在「链接」页。对话里只亮侧栏角标，不在视频列表上盖浮层。
-        self.main.rowconfigure(1, weight=0 if on_links else 1)
+        # 主内容有最小高度，日志不参与伸缩，避免小窗口把任务区挤没。
         if on_links:
+            self.main.rowconfigure(1, weight=0, minsize=ui_px(120))
             self.tasks.set_pane_mode(compact=False, closable=False)
-            self.main.rowconfigure(2, weight=1)
+            self.main.rowconfigure(2, weight=1, minsize=ui_px(160))
             if not self.tasks.winfo_ismapped():
                 self.tasks.grid(row=2, column=0, sticky="nsew", padx=16, pady=(10, 0))
-            if self.lbl_ready.winfo_ismapped():
-                self.lbl_ready.pack_forget()
         else:
             if self.tasks.winfo_ismapped():
                 self.tasks.grid_forget()
-            self.main.rowconfigure(2, weight=0)
-            if self.lbl_ready.winfo_ismapped():
-                self.lbl_ready.pack_forget()
+            self.main.rowconfigure(1, weight=1, minsize=ui_px(220))
+            self.main.rowconfigure(2, weight=0, minsize=0)
         self._refresh_links_badge()
+        self._refresh_download_status()
 
     def _refresh_links_badge(self) -> None:
         if not hasattr(self, "nav_links"):
@@ -3900,6 +4316,13 @@ class App(tk.Tk):
         if count <= 0:
             return
         self._refresh_links_badge()
+        refresh = getattr(self, "_refresh_download_status", None)
+        if callable(refresh):
+            refresh()
+        label = "已加入下载队列" if count == 1 else f"已加入下载队列，共 {count} 项"
+        toast = getattr(self, "_toast", None)
+        if callable(toast):
+            toast(label)
         nav = getattr(self, "nav_links", None)
         if nav is not None and getattr(self, "_page", "") != "links":
             try:
@@ -3911,15 +4334,13 @@ class App(tk.Tk):
         self._log_open = not self._log_open
         if self._log_open:
             self.btn_log.configure(text="▾ 日志")
-            self.log_wrap.grid(row=4, column=0, sticky="nsew", padx=16, pady=(0, 12))
-            self.main.rowconfigure(4, weight=0)
-            if not self.btn_clear_log.winfo_ismapped():
-                self.btn_clear_log.pack(side="right")
+            self.log_wrap.configure(height=ui_px(112))
+            self.log_wrap.grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 8))
+            self.main.rowconfigure(4, weight=0, minsize=0)
         else:
             self.btn_log.configure(text="▸ 日志")
             self.log_wrap.grid_forget()
-            if self.btn_clear_log.winfo_ismapped():
-                self.btn_clear_log.pack_forget()
+            self.main.rowconfigure(4, weight=0, minsize=0)
 
     def _set_logged_in_state(self, logged_in: bool, name: str = "") -> None:
         self._logged_in = logged_in
@@ -4017,11 +4438,11 @@ class App(tk.Tk):
         grid.columnconfigure(1, weight=1)
         self._form_label(grid, "api_id").grid(row=0, column=0, sticky="e", padx=(0, 10), pady=(0, 8))
         self.var_api_id = tk.StringVar(value=str(self.cfg.get("api_id") or ""))
-        self._form_entry(grid, self.var_api_id, placeholder="数字").grid(row=0, column=1, sticky="ew", pady=(0, 8))
+        self._form_entry(grid, self.var_api_id, placeholder="数字", show="•").grid(row=0, column=1, sticky="ew", pady=(0, 8))
         self._form_label(grid, "api_hash").grid(row=1, column=0, sticky="e", padx=(0, 10))
         self.var_api_hash = tk.StringVar(value=str(self.cfg.get("api_hash") or ""))
-        self._form_entry(grid, self.var_api_hash, placeholder="从申请页复制").grid(row=1, column=1, sticky="ew")
-        self._form_help(b, "只保存在本机，请不要发给别人。").pack(fill="x", pady=(12, 0))
+        self._form_entry(grid, self.var_api_hash, placeholder="从申请页复制", show="•").grid(row=1, column=1, sticky="ew")
+        self._form_help(b, "只保存在本机凭据里，界面默认掩码，请不要发给别人。").pack(fill="x", pady=(12, 0))
         ft = tk.Frame(b, bg=C_CARD)
         ft.pack(fill="x", pady=(16, 0))
         FlatButton(ft, "保存并继续", command=self._save_api, variant="primary", bg=C_CARD).pack(side="right")
@@ -4104,7 +4525,7 @@ class App(tk.Tk):
 
         self.lbl_proxy_status = tk.Label(b, text="", bg=C_CARD, fg=C_TEXT2, font=Fonts.help, anchor="w", justify="left", wraplength=400)
         self.lbl_proxy_status.pack(fill="x", pady=(12, 0))
-        tk.Label(b, text="改完需重启再生效", bg=C_CARD, fg=C_TEXT3, font=Fonts.help, anchor="w").pack(fill="x", pady=(6, 0))
+        tk.Label(b, text="保存后立即重连，不用重启软件。", bg=C_CARD, fg=C_TEXT3, font=Fonts.help, anchor="w").pack(fill="x", pady=(6, 0))
 
         ft = tk.Frame(b, bg=C_CARD)
         ft.pack(fill="x", pady=(16, 0))
@@ -4112,7 +4533,7 @@ class App(tk.Tk):
         left.pack(side="left")
         FlatButton(left, "检测本机", command=self._detect_proxy, bg=C_CARD).pack(side="left")
         FlatButton(left, "测试", command=self._test_proxy, bg=C_CARD).pack(side="left", padx=(8, 0))
-        FlatButton(ft, "保存", command=self._save_proxy, variant="primary", bg=C_CARD).pack(side="right")
+        FlatButton(ft, "应用并重连", command=self._save_proxy, variant="primary", bg=C_CARD).pack(side="right")
         FlatButton(ft, "取消", command=self.dlg_proxy.hide, bg=C_CARD).pack(side="right", padx=(0, 8))
 
     def _build_dlg_about(self) -> None:
@@ -4274,11 +4695,12 @@ class App(tk.Tk):
         self._show_dialog(self.dlg_api)
 
     def _load_about_icon(self) -> Optional[ImageTk.PhotoImage]:
-        png = resource_path("app-icon-64.png", "app-icon-256.png")
+        png = resource_path("app-icon-256.png", "app-icon-64.png")
         if png is None:
             return None
         try:
-            img = Image.open(png).convert("RGBA").resize((40, 40), Image.Resampling.LANCZOS)
+            px = max(32, scaled_px(40, self))
+            img = Image.open(png).convert("RGBA").resize((px, px), Image.Resampling.LANCZOS)
             self._about_icon_img = ImageTk.PhotoImage(img)
             return self._about_icon_img
         except Exception:
@@ -4296,39 +4718,50 @@ class App(tk.Tk):
         self.lbl_proxy_status.configure(text=text, fg=color)
 
     def _detect_proxy(self) -> None:
-        items = detect_local_proxies()
-        if not items:
-            self._set_proxy_status("没有检测到本机常见代理端口。请先打开 Clash / v2rayN，并确认端口已开启。", "err")
-            return
-        best = pick_best_proxy(items)
-        assert best
-        self._fill_proxy_vars(best)
-        lines = [f"已填入：{best['label']}（{best['type']} {best['host']}:{best['port']}）。"]
-        if len(items) > 1:
-            others = "、".join(f"{i['type']} {i['host']}:{i['port']}" for i in items if i is not best)
-            if others:
-                lines.append(f"另外还发现：{others}")
-        self._set_proxy_status(" ".join(lines), "ok")
+        self._set_proxy_status("正在检测本机代理…")
+
+        def work() -> None:
+            items = detect_local_proxies()
+
+            def apply() -> None:
+                if not items:
+                    self._set_proxy_status("没有检测到本机常见代理端口。请先打开 Clash / v2rayN，并确认端口已开启。", "err")
+                    return
+                best = pick_best_proxy(items)
+                if not best:
+                    self._set_proxy_status("没有检测到本机常见代理端口。请先打开 Clash / v2rayN，并确认端口已开启。", "err")
+                    return
+                self._fill_proxy_vars(best)
+                lines = [f"已填入：{best['label']}（{best['type']} {best['host']}:{best['port']}）。"]
+                if len(items) > 1:
+                    others = "、".join(f"{i['type']} {i['host']}:{i['port']}" for i in items if i is not best)
+                    if others:
+                        lines.append(f"另外还发现：{others}")
+                self._set_proxy_status(" ".join(lines), "ok")
+
+            self._ui(apply)
+
+        threading.Thread(target=work, name="proxy-detect", daemon=True).start()
 
     def _test_proxy(self) -> None:
         self._sync_proxy_kind()
         kind = (self.var_proxy_type.get() or "none").strip().lower()
         host = (self.var_proxy_host.get() or "").strip() or "127.0.0.1"
         port_s = (self.var_proxy_port.get() or "").strip()
+        user = (self.var_proxy_user.get() or "").strip()
+        password = self.var_proxy_pass.get() or ""
         self._set_proxy_status("正在测试…")
-        self.dlg_proxy.update_idletasks()
-        try:
-            port = int(port_s) if port_s else 0
-            msg = test_proxy_connection(
-                kind,
-                host,
-                port,
-                user=(self.var_proxy_user.get() or "").strip(),
-                password=self.var_proxy_pass.get() or "",
-            )
-            self._set_proxy_status(msg, "ok")
-        except Exception as exc:
-            self._set_proxy_status(explain_error(exc), "err")
+
+        def work() -> None:
+            try:
+                port = int(port_s) if port_s else 0
+                msg = test_proxy_connection(kind, host, port, user=user, password=password)
+                self._ui(lambda m=msg: self._set_proxy_status(m, "ok"))
+            except Exception as exc:
+                text = explain_error(exc)
+                self._ui(lambda t=text: self._set_proxy_status(t, "err"))
+
+        threading.Thread(target=work, name="proxy-test", daemon=True).start()
 
     def _start_loop_and_connect(self) -> None:
         self._ensure_loop()
@@ -4438,8 +4871,19 @@ class App(tk.Tk):
         kind = getattr(self, "_chat_filter", "全部")
         items = filter_dialogs(self._dialogs, kind, q)
         selected = visible_chat_selection(self._selected_dialog, items)
+        if hasattr(self, "chat_filters"):
+            self.chat_filters.set_counts(dialog_kind_counts(self._dialogs))
         self.chat_list.set_items(items, selected)
         self.chat_list.apply_avatars(self._avatar_bytes, token=self._avatar_gen)
+
+    def _schedule_chat_refresh(self) -> None:
+        token = self._search_after
+        if token:
+            try:
+                self.after_cancel(token)
+            except Exception:
+                pass
+        self._search_after = self.after(50, self._refresh_chat_list)
 
     def _start_avatar_loads(self, dialogs: list[DialogItem]) -> None:
         if not self.service:
@@ -4530,8 +4974,15 @@ class App(tk.Tk):
         except Exception as exc:
             messagebox.showerror(APP_NAME, explain_error(exc), parent=self.dlg_proxy)
             return
+        if self._busy and not messagebox.askyesno(
+            APP_NAME,
+            "应用并重连会中断正在进行的下载，然后用新的代理重新连接。确定继续？",
+            parent=self.dlg_proxy,
+        ):
+            return
         self.dlg_proxy.hide()
         self._log(f"代理已保存：{format_proxy_label(self.cfg)}，正在重新连接…")
+        self._toast("正在按新代理重新连接…")
         self._reset_service_and_reconnect()
 
     def _reset_service_and_reconnect(self) -> None:
@@ -4876,6 +5327,12 @@ class App(tk.Tk):
             **extra,
         )
         self._ui(lambda k=key: self._paint_task(k))
+        if status == "error" and error:
+            reason = short_failure_reason(error)
+            self._ui(lambda r=reason: self._toast(f"失败：{r}", "err"))
+            self._ui(self._refresh_download_status)
+        elif status in ("queued", "running", "done", "stopped"):
+            self._ui(self._refresh_download_status)
         return True
 
     def _on_download_link(self) -> None:
@@ -4902,9 +5359,13 @@ class App(tk.Tk):
             self._seed_tasks(self._link_rows(gen, jobs), paint_now=True)
             self.tasks.set_header(f"完成：成功 0，失败 {len(jobs)}", show_stop=False)
             self._log("这些链接都无法识别，没有开始下载。失败的那一条可以点「删除」去掉。")
+            reason = short_failure_reason(jobs[0].error) if jobs and jobs[0].error else "链接无法识别"
+            self._toast(f"失败：{reason}", "err")
+            self._refresh_download_status()
             return
         valid = sum(1 for job in jobs if job.parsed)
         label = "链接下载" if valid == 1 and len(jobs) == 1 else f"链接下载（{len(jobs)} 条）"
+        self._toast("已加入下载队列" if valid == 1 else f"已加入下载队列，共 {valid} 项")
         self._start_task(self._async_download_links(jobs, folder, gen), label=label)
 
     def _link_rows(self, gen: int, jobs: list[Any]) -> list[tuple[str, str, str, str, str, int]]:
@@ -5065,8 +5526,15 @@ class App(tk.Tk):
             self._video_scan = VideoScanState()
             self._video_notices = []
             self._video_has_more = True
+            self._video_seen = 0
+            self._video_total = 0
+            self._video_pages = 0
+            self._video_scanning_all = False
+            self._video_scan_cancel = False
             self.video_list.clear()
+            self.video_list.set_more_prompt("")
             self._video_gen += 1
+            self._run_async(self._async_count_messages(item, self._video_gen), on_error=lambda _e: None)
         gen = self._video_gen
         self._video_loading = True
         self._reveal_video_chrome(item.title)
@@ -5078,6 +5546,17 @@ class App(tk.Tk):
             self._async_list_videos(item, gen, state),
             on_error=lambda exc, g=gen: self._on_videos_error(g, exc),
         )
+
+    async def _async_count_messages(self, item: DialogItem, gen: int) -> None:
+        assert self.service
+        total = await self.service.count_messages(item.entity)
+
+        def _apply() -> None:
+            if gen == self._video_gen:
+                self._video_total = max(0, int(total or 0))
+                self._sync_chat_actions()
+
+        self._ui(_apply)
 
     async def _async_list_videos(self, item: DialogItem, gen: int, state: VideoScanState) -> None:
         assert self.service
@@ -5150,9 +5629,25 @@ class App(tk.Tk):
             if self._video_items:
                 self._show_video_list()
         self._video_has_more = bool(page.has_more)
+        self._video_seen += int(getattr(page, "scanned", 0) or 0)
+        self._video_pages += 1
+        if self._video_pages >= 500:
+            self._video_has_more = False
+        keep_scanning = (
+            self._video_scanning_all
+            and self._video_has_more
+            and not self._video_scan_cancel
+            and gen == self._video_gen
+        )
+        if self._video_scanning_all and not keep_scanning:
+            self._video_scanning_all = False
+            self._video_scan_cancel = False
+            self._toast(f"扫描完成，共 {len(self._video_items)} 个视频")
         self._sync_quality_options()
         self.video_list.refresh_quality(quality_pref_value(self.var_quality.get()))
         self._sync_chat_actions()
+        if keep_scanning:
+            self.after(20, lambda g=gen: self._continue_scan(g))
 
     def _apply_video_thumb(self, gen: int, message_id: int, data: bytes) -> None:
         if gen != self._video_gen:
@@ -5167,6 +5662,7 @@ class App(tk.Tk):
         if gen != self._video_gen:
             return
         self._video_loading = False
+        self._video_scanning_all = False
         self._sync_chat_actions()
         msg = explain_error(exc)
         self._log(msg, error=True)
@@ -5182,6 +5678,28 @@ class App(tk.Tk):
             messagebox.showwarning(APP_NAME, "请先登录。")
             return
         self._start_load_videos(self._video_chat, reset=False)
+
+    def _on_scan_all(self) -> None:
+        if self._video_scanning_all and not self._video_scan_cancel:
+            self._video_scan_cancel = True
+            self._toast("正在停止扫描…")
+            self._sync_chat_actions()
+            return
+        if not self._video_chat or not self._video_has_more:
+            return
+        self._video_scan_cancel = False
+        self._video_scanning_all = True
+        self._toast("开始扫描全部视频")
+        self._sync_chat_actions()
+        if not self._video_loading:
+            self._on_load_more()
+
+    def _continue_scan(self, gen: int) -> None:
+        if gen != self._video_gen or not self._video_scanning_all or self._video_scan_cancel:
+            self._video_scanning_all = False
+            self._sync_chat_actions()
+            return
+        self._on_load_more()
 
     def _chat_task_rows(
         self, gen: int, messages: list[Any], title: str
@@ -5608,16 +6126,43 @@ class App(tk.Tk):
         self._ui(lambda: self._log(text, error=error))
 
     def _drain_ui_queue(self) -> None:
+        budget = 8
         try:
-            while True:
+            while budget:
                 fn = self._ui_q.get_nowait()
+                budget -= 1
                 try:
                     fn()
                 except Exception:
                     traceback.print_exc()
         except queue.Empty:
             pass
-        self.after(80, self._drain_ui_queue)
+        # 队列还有活就尽快再排一拍，避免一次清空把界面卡住。
+        self.after(16 if budget == 0 else 40, self._drain_ui_queue)
+
+    def _toast(self, text: str, kind: str = "info") -> None:
+        toast = getattr(self, "toast", None)
+        if toast is not None:
+            toast.show(text, kind)
+
+    def _refresh_download_status(self) -> None:
+        label = getattr(self, "lbl_status", None)
+        if label is None:
+            return
+        active = 0
+        tasks = getattr(self, "tasks", None)
+        if tasks is not None:
+            try:
+                counts = tasks.counts()
+            except Exception:
+                counts = None
+            if isinstance(counts, tuple) and len(counts) >= 3:
+                # counts() is (done, running, total) — active is total minus done when known.
+                done, running, total = counts[0], counts[1], counts[2]
+                active = max(int(running or 0), int(total or 0) - int(done or 0))
+        if active <= 0 and self._busy:
+            active = 1
+        label.configure(text=download_status_text(active))
 
     def _log(self, text: str, error: bool = False) -> None:
         self.txt_log.configure(state="normal")
@@ -5665,10 +6210,10 @@ class App(tk.Tk):
 
     def _apply_dpi_window(self) -> None:
         scale = float(getattr(Fonts, "scale", 1.0) or 1.0)
-        if scale <= 1.01:
-            return
-        self.geometry(f"{ui_px(WINDOW_W)}x{ui_px(WINDOW_H)}")
-        self.minsize(ui_px(WINDOW_MIN_W), ui_px(WINDOW_MIN_H))
+        width, height = window_size_for_scale(scale)
+        self._min_w, self._min_h = min_window_for_scale(scale)
+        self.geometry(f"{width}x{height}")
+        self.minsize(self._min_w, self._min_h)
 
     def _on_window_map(self, event: tk.Event) -> None:
         if event.widget is self:

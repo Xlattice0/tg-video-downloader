@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -208,24 +210,285 @@ def ensure_data_dir() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def load_config() -> dict:
+# api_id / api_hash 不写入 config.json。Windows 优先放进凭据管理器，
+# 其它环境（以及凭据管理器失败时）落到仅当前用户可读的本地加密文件。
+SECRET_KEYS = ("api_id", "api_hash")
+_CRED_TARGET = "Xlattice0.TGVideoDownloader/telegram-api"
+_SECRET_MAGIC = b"TGSEC1"
+
+
+def _secret_file() -> Path:
+    return DATA_DIR / "api.secret"
+
+
+def _secret_key_file() -> Path:
+    return DATA_DIR / "api.key"
+
+
+def _use_credential_manager() -> bool:
+    if os.environ.get("TGVD_SECRET_BACKEND", "").strip().lower() == "file":
+        return False
+    return sys.platform == "win32"
+
+
+def _tighten_private(path: Path, directory: bool = False) -> None:
+    """仅当前用户可读写。失败不影响保存。"""
+    try:
+        if sys.platform == "win32":
+            username = os.environ.get("USERNAME") or ""
+            if not username or not path.exists():
+                return
+            flags = 0x08000000  # CREATE_NO_WINDOW
+            grant = "(OI)(CI)F" if directory else "F"
+            subprocess_args = [
+                "icacls",
+                str(path),
+                "/inheritance:r",
+                "/grant:r",
+                f"{username}:{grant}",
+            ]
+            import subprocess
+            subprocess.run(subprocess_args, capture_output=True, check=False, creationflags=flags)
+            return
+        os.chmod(path, 0o700 if directory else 0o600)
+    except OSError:
+        pass
+
+
+def _load_or_create_key() -> bytes:
     ensure_data_dir()
+    path = _secret_key_file()
+    if path.is_file():
+        data = path.read_bytes()
+        if len(data) >= 32:
+            return data[:32]
+    key = os.urandom(32)
+    path.write_bytes(key)
+    _tighten_private(path)
+    return key
+
+
+def _keystream(key: bytes, nonce: bytes, length: int) -> bytes:
+    out = bytearray()
+    counter = 0
+    while len(out) < length:
+        block = hmac.new(key, nonce + counter.to_bytes(4, "big"), hashlib.sha256).digest()
+        out.extend(block)
+        counter += 1
+    return bytes(out[:length])
+
+
+def _seal_secret(plain: bytes) -> bytes:
+    key = _load_or_create_key()
+    nonce = os.urandom(16)
+    cipher = bytes(a ^ b for a, b in zip(plain, _keystream(key, nonce, len(plain))))
+    mac = hmac.new(key, nonce + cipher, hashlib.sha256).digest()
+    return _SECRET_MAGIC + nonce + mac + cipher
+
+
+def _unseal_secret(blob: bytes) -> Optional[bytes]:
+    if not blob.startswith(_SECRET_MAGIC) or len(blob) < len(_SECRET_MAGIC) + 16 + 32:
+        return None
+    try:
+        key = _load_or_create_key()
+    except OSError:
+        return None
+    rest = blob[len(_SECRET_MAGIC):]
+    nonce, mac, cipher = rest[:16], rest[16:48], rest[48:]
+    expect = hmac.new(key, nonce + cipher, hashlib.sha256).digest()
+    if not hmac.compare_digest(mac, expect):
+        return None
+    return bytes(a ^ b for a, b in zip(cipher, _keystream(key, nonce, len(cipher))))
+
+
+def _parse_secret_payload(blob: Optional[bytes]) -> tuple[str, str]:
+    if not blob:
+        return "", ""
+    try:
+        data = json.loads(blob.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError, TypeError):
+        return "", ""
+    if not isinstance(data, dict):
+        return "", ""
+    api_id = str(data.get("api_id") or "").strip()
+    api_hash = str(data.get("api_hash") or "").strip()
+    if not api_id or not api_hash:
+        return "", ""
+    return api_id, api_hash
+
+
+def _cred_write(payload: bytes) -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class CREDENTIAL(ctypes.Structure):
+            _fields_ = [
+                ("Flags", wintypes.DWORD),
+                ("Type", wintypes.DWORD),
+                ("TargetName", wintypes.LPWSTR),
+                ("Comment", wintypes.LPWSTR),
+                ("LastWritten", wintypes.FILETIME),
+                ("CredentialBlobSize", wintypes.DWORD),
+                ("CredentialBlob", ctypes.POINTER(ctypes.c_byte)),
+                ("Persist", wintypes.DWORD),
+                ("AttributeCount", wintypes.DWORD),
+                ("Attributes", ctypes.c_void_p),
+                ("TargetAlias", wintypes.LPWSTR),
+                ("UserName", wintypes.LPWSTR),
+            ]
+
+        blob = ctypes.create_string_buffer(payload)
+        cred = CREDENTIAL()
+        cred.Type = 1  # CRED_TYPE_GENERIC
+        cred.TargetName = _CRED_TARGET
+        cred.CredentialBlobSize = len(payload)
+        cred.CredentialBlob = ctypes.cast(blob, ctypes.POINTER(ctypes.c_byte))
+        cred.Persist = 2  # CRED_PERSIST_LOCAL_MACHINE
+        cred.UserName = "telegram-api"
+        advapi32 = ctypes.windll.advapi32
+        advapi32.CredWriteW.argtypes = [ctypes.POINTER(CREDENTIAL), wintypes.DWORD]
+        advapi32.CredWriteW.restype = wintypes.BOOL
+        return bool(advapi32.CredWriteW(ctypes.byref(cred), 0))
+    except Exception:
+        return False
+
+
+def _cred_read() -> Optional[bytes]:
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class CREDENTIAL(ctypes.Structure):
+            _fields_ = [
+                ("Flags", wintypes.DWORD),
+                ("Type", wintypes.DWORD),
+                ("TargetName", wintypes.LPWSTR),
+                ("Comment", wintypes.LPWSTR),
+                ("LastWritten", wintypes.FILETIME),
+                ("CredentialBlobSize", wintypes.DWORD),
+                ("CredentialBlob", ctypes.POINTER(ctypes.c_byte)),
+                ("Persist", wintypes.DWORD),
+                ("AttributeCount", wintypes.DWORD),
+                ("Attributes", ctypes.c_void_p),
+                ("TargetAlias", wintypes.LPWSTR),
+                ("UserName", wintypes.LPWSTR),
+            ]
+
+        advapi32 = ctypes.windll.advapi32
+        advapi32.CredReadW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.POINTER(ctypes.POINTER(CREDENTIAL)),
+        ]
+        advapi32.CredReadW.restype = wintypes.BOOL
+        advapi32.CredFree.argtypes = [ctypes.c_void_p]
+        pcred = ctypes.POINTER(CREDENTIAL)()
+        if not advapi32.CredReadW(_CRED_TARGET, 1, 0, ctypes.byref(pcred)):
+            return None
+        try:
+            cred = pcred.contents
+            if not cred.CredentialBlob or cred.CredentialBlobSize <= 0:
+                return None
+            return ctypes.string_at(cred.CredentialBlob, int(cred.CredentialBlobSize))
+        finally:
+            advapi32.CredFree(pcred)
+    except Exception:
+        return None
+
+
+def _write_file_secret(payload: bytes) -> None:
+    ensure_data_dir()
+    path = _secret_file()
+    path.write_bytes(_seal_secret(payload))
+    _tighten_private(path)
+
+
+def _read_file_secret() -> tuple[str, str]:
+    path = _secret_file()
+    if not path.is_file():
+        return "", ""
+    try:
+        return _parse_secret_payload(_unseal_secret(path.read_bytes()))
+    except OSError:
+        return "", ""
+
+
+def store_api_credentials(api_id: str, api_hash: str) -> None:
+    """把 API 凭据交给系统保管。不写日志，不写入 config.json。"""
+    api_id = str(api_id or "").strip()
+    api_hash = str(api_hash or "").strip()
+    if not api_id or not api_hash:
+        return
+    payload = json.dumps({"api_id": api_id, "api_hash": api_hash}, ensure_ascii=False).encode("utf-8")
+    if _use_credential_manager() and _cred_write(payload):
+        try:
+            _secret_file().unlink(missing_ok=True)
+        except OSError:
+            pass
+        return
+    _write_file_secret(payload)
+
+
+def load_api_credentials() -> tuple[str, str]:
+    if _use_credential_manager():
+        found = _parse_secret_payload(_cred_read())
+        if found[0] and found[1]:
+            return found
+    return _read_file_secret()
+
+
+def _strip_secret_keys(data: dict) -> dict:
+    return {key: value for key, value in data.items() if key not in SECRET_KEYS}
+
+
+def _read_config_file() -> dict:
     if not CONFIG_PATH.exists():
         return {}
     try:
         data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_config_file(data: dict) -> None:
+    ensure_data_dir()
+    clean = _strip_secret_keys(data)
+    CONFIG_PATH.write_text(json.dumps(clean, ensure_ascii=False, indent=2), encoding="utf-8")
+    _tighten_private(CONFIG_PATH)
+
+
+def load_config() -> dict:
+    ensure_data_dir()
+    raw = _read_config_file()
+    file_id = str(raw.get("api_id") or "").strip()
+    file_hash = str(raw.get("api_hash") or "").strip()
+    if file_id or file_hash:
+        if file_id and file_hash:
+            store_api_credentials(file_id, file_hash)
+        _write_config_file(raw)
+    stored_id, stored_hash = load_api_credentials()
+    cfg = _strip_secret_keys(raw)
+    if stored_id:
+        cfg["api_id"] = stored_id
+    if stored_hash:
+        cfg["api_hash"] = stored_hash
+    return cfg
 
 
 def save_config(data: dict) -> None:
-    ensure_data_dir()
-    # 不把会话字节写入配置
-    CONFIG_PATH.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    """配置落盘时去掉 API 凭据。内存里的 dict 保持原样，供当前进程继续使用。"""
+    api_id = str(data.get("api_id") or "").strip()
+    api_hash = str(data.get("api_hash") or "").strip()
+    if api_id and api_hash:
+        store_api_credentials(api_id, api_hash)
+    _write_config_file(data)
 
 
 def update_config(**kwargs: Any) -> dict:
@@ -1199,8 +1462,48 @@ def video_display_title(item: VideoItem) -> str:
     cap = (item.caption or "").strip()
     if cap:
         return cap.splitlines()[0].strip() or "视频"
-    if item.filename:
+    if item.filename and not opaque_media_stem(item.filename):
         return Path(item.filename).name
+    return "视频"
+
+
+def message_caption_line(msg: Any) -> str:
+    cap = getattr(msg, "message", None) or getattr(msg, "raw_text", None) or ""
+    if not isinstance(cap, str):
+        cap = str(cap or "")
+    line = cap.strip().splitlines()[0].strip() if cap.strip() else ""
+    return line
+
+
+def opaque_media_stem(name: Optional[str]) -> bool:
+    """Telegram 常把媒体存成 20.mp4 这种没有标题的序号文件。"""
+    stem = Path(str(name or "")).stem.strip()
+    return bool(stem) and stem.isdigit()
+
+
+def readable_task_title(
+    caption: str = "",
+    chat_title: str = "",
+    message_id: Any = 0,
+    filename: Optional[str] = None,
+) -> str:
+    """任务列表用的名字：消息标题，否则「频道 · 消息 id」，不用 20.mp4 这种序号。"""
+    cap = (caption or "").strip().splitlines()[0].strip() if caption else ""
+    if cap:
+        return cap[:80]
+    title = (chat_title or "").strip()
+    try:
+        mid = int(message_id or 0)
+    except (TypeError, ValueError):
+        mid = 0
+    if title and mid:
+        return f"{title} · {mid}"
+    if title:
+        return title
+    if filename and not opaque_media_stem(filename):
+        return Path(filename).name
+    if mid:
+        return f"视频 · {mid}"
     return "视频"
 
 
@@ -1240,8 +1543,13 @@ def build_save_name(msg: Any, chat_title: str) -> str:
     date_tag = file_date_tag(getattr(msg, "date", None))
     title = sanitize_filename(chat_title or "chat", max_len=40)
     mid = getattr(msg, "id", 0)
-    if original:
+    caption = message_caption_line(msg)
+    # 日期、对话、消息 id 始终留在文件名里。序号文件名（20.mp4）换成消息标题。
+    if original and not opaque_media_stem(original):
         stem = sanitize_filename(Path(original).stem, max_len=50)
+        name = f"{date_tag}_{title}_{mid}_{stem}{ext}"
+    elif caption:
+        stem = sanitize_filename(caption, max_len=40)
         name = f"{date_tag}_{title}_{mid}_{stem}{ext}"
     else:
         name = f"{date_tag}_{title}_{mid}{ext}"
@@ -1709,6 +2017,17 @@ async def gather_chat_video_page(
         notices=notices,
         scanned=int(history_report.get("scanned") or 0),
     )
+
+
+def dialog_kind_counts(dialogs: Iterable[DialogItem]) -> dict[str, int]:
+    """全部 / 频道 / 群组 / 私聊 / 机器人 的数量，给筛选条用。"""
+    counts = {"全部": 0, "频道": 0, "群组": 0, "私聊": 0, "机器人": 0}
+    for dialog in dialogs:
+        counts["全部"] += 1
+        kind = getattr(dialog, "kind", "") or ""
+        if kind in counts:
+            counts[kind] += 1
+    return counts
 
 
 def filter_dialogs(dialogs: Iterable[DialogItem], kind: str = "全部", query: str = "") -> list[DialogItem]:
@@ -2496,6 +2815,12 @@ class TelegramService:
                 )
             )
         return items
+
+    async def count_messages(self, entity: Any) -> int:
+        """对话里的消息总数，用来估算扫描进度。失败时由调用方当作未知。"""
+        peer = await self.resolve_entity(entity)
+        result = await self.client.get_messages(peer, limit=0)
+        return int(getattr(result, "total", 0) or 0)
 
     async def list_chat_videos(
         self,

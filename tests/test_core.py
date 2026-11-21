@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -42,6 +43,7 @@ from tgcore import (
     canonical_peer_id,
     classify_video_message,
     dialog_kind,
+    dialog_kind_counts,
     dialog_title,
     explain_error,
     filter_dialogs,
@@ -52,6 +54,7 @@ from tgcore import (
     is_user_stop,
     link_failure_text,
     list_video_qualities,
+    load_config,
     load_download_records,
     load_unfinished_tasks,
     login_dialog_after_session_loss,
@@ -64,11 +67,13 @@ from tgcore import (
     record_download,
     restored_link_text,
     quality_pref_value,
+    readable_task_title,
     sanitize_filename,
     snap_quality_height,
     split_link_text,
     startup_login_target,
     unique_path,
+    update_config,
     validate_proxy_settings,
     video_downloaded_label,
     visible_chat_selection,
@@ -704,6 +709,82 @@ class PersistenceTests(unittest.TestCase):
             self.assertFalse(items[0].downloaded)
             # 对话里另存的那条文件还在
             self.assertTrue(items[1].downloaded)
+
+
+class SecretAndNameTests(unittest.TestCase):
+    def test_readable_names_replace_opaque_filenames(self) -> None:
+        self.assertEqual(readable_task_title("水果派 261121P", "频道", 20, "20.mp4"), "水果派 261121P")
+        self.assertEqual(readable_task_title("", "频道", 20, "20.mp4"), "频道 · 20")
+        self.assertEqual(readable_task_title("", "", 0, "clip.mp4"), "clip.mp4")
+        msg = _msg(
+            20,
+            _video_media(1, attrs=[_video_attr(), DocumentAttributeFilename("20.mp4")]),
+            text="水果派 261121P",
+        )
+        name = build_save_name(msg, "频道A")
+        self.assertIn("_20_", name)
+        self.assertIn("水果派", name)
+        self.assertTrue(name.endswith(".mp4"))
+        self.assertFalse(name.endswith("_20.mp4"))
+
+    def test_dialog_kind_counts(self) -> None:
+        items = [
+            DialogItem(None, "a", "频道", 1),
+            DialogItem(None, "b", "频道", 2),
+            DialogItem(None, "c", "群组", 3),
+            DialogItem(None, "d", "私聊", 4),
+            DialogItem(None, "e", "机器人", 5),
+        ]
+        counts = dialog_kind_counts(items)
+        self.assertEqual(counts, {"全部": 5, "频道": 2, "群组": 1, "私聊": 1, "机器人": 1})
+
+    def test_api_secrets_are_not_plaintext_in_config(self) -> None:
+        import tgcore
+
+        api_id = "10001"
+        api_hash = "0123456789abcdef0123456789abcdef"
+        old_env = os.environ.get("TGVD_SECRET_BACKEND")
+        os.environ["TGVD_SECRET_BACKEND"] = "file"
+        old = (tgcore.DATA_DIR, tgcore.CONFIG_PATH)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                data = Path(tmp)
+                tgcore.DATA_DIR = data
+                tgcore.CONFIG_PATH = data / "config.json"
+                cfg = update_config(api_id=api_id, api_hash=api_hash, last_save_folder="D:/videos")
+                text = tgcore.CONFIG_PATH.read_text(encoding="utf-8")
+                self.assertNotIn(api_hash, text)
+                self.assertNotIn(api_id, text)
+                self.assertIn("last_save_folder", text)
+                self.assertEqual(cfg["api_id"], api_id)
+                self.assertEqual(cfg["api_hash"], api_hash)
+                again = load_config()
+                self.assertEqual(again["api_hash"], api_hash)
+                secret = data / "api.secret"
+                self.assertTrue(secret.is_file())
+                raw = secret.read_bytes()
+                self.assertTrue(raw.startswith(b"TGSEC1"))
+                self.assertNotIn(api_hash.encode("utf-8"), raw)
+                self.assertEqual(secret.stat().st_mode & 0o777, 0o600)
+                secret.unlink()
+                (data / "api.key").unlink(missing_ok=True)
+                tgcore.CONFIG_PATH.write_text(
+                    '{"api_id": "10001", "api_hash": "%s", "proxy_type": "none"}' % api_hash,
+                    encoding="utf-8",
+                )
+                migrated = load_config()
+                stored = tgcore.CONFIG_PATH.read_text(encoding="utf-8")
+                self.assertNotIn(api_hash, stored)
+                self.assertNotIn(api_id, stored)
+                self.assertEqual(migrated["api_id"], api_id)
+                self.assertEqual(migrated["api_hash"], api_hash)
+                self.assertEqual(migrated.get("proxy_type"), "none")
+        finally:
+            tgcore.DATA_DIR, tgcore.CONFIG_PATH = old
+            if old_env is None:
+                os.environ.pop("TGVD_SECRET_BACKEND", None)
+            else:
+                os.environ["TGVD_SECRET_BACKEND"] = old_env
 
 
 if __name__ == "__main__":

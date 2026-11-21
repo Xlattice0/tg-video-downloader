@@ -55,7 +55,11 @@ class VisualTokenTests(unittest.TestCase):
         self.assertNotIn("打开申请页", source)
         self.assertNotIn("1.4 设计稿", source)
         self.assertNotIn("ui_mode", source)
-        self.assertIn("改完需重启再生效", source)
+        self.assertNotIn("改完需重启再生效", source)
+        self.assertIn("应用并重连", source)
+        self.assertIn("每行一条链接", source)
+        self.assertIn("下载优先清晰度", source)
+        self.assertIn("还有更多未扫描，点击继续加载", source)
         self.assertIn("更改 API 凭据", source)
         self.assertIn(f'geometry(f"{{WINDOW_W}}x{{WINDOW_H}}")', source)
 
@@ -228,7 +232,8 @@ class TaskChromeTests(unittest.TestCase):
             tasks.btn_stop._on_click()
             self.assertEqual(opened, ["pause"])
             source = (ROOT / "app.py").read_text(encoding="utf-8")
-            self.assertIn('FlatButton(path, "打开文件夹"', source)
+            self.assertNotIn('FlatButton(path, "打开文件夹"', source)
+            self.assertIn('("打开文件夹", self._open_folder, False)', source)
         finally:
             root.destroy()
 
@@ -378,6 +383,123 @@ class AppIconTests(unittest.TestCase):
         self.assertGreater(field[2], field[0] + 100)
         self.assertEqual(png.getpixel((80, 60))[:3], (255, 255, 255))
         self.assertEqual(png.getpixel((200, 200))[:3], (255, 255, 255))
+
+
+class SharpnessAndCopyTests(unittest.TestCase):
+    def test_window_scale_is_applied_once(self) -> None:
+        self.assertEqual(app.window_size_for_scale(1), (960, 680))
+        self.assertEqual(app.window_size_for_scale(1.02), (960, 680))
+        self.assertEqual(app.window_size_for_scale(1.5), (1440, 1020))
+        self.assertEqual(app.window_size_for_scale(2), (1920, 1360))
+        self.assertEqual(app.min_window_for_scale(1), (app.WINDOW_MIN_W, app.WINDOW_MIN_H))
+        self.assertEqual(app.min_window_for_scale(2), (app.WINDOW_MIN_W * 2, app.WINDOW_MIN_H * 2))
+
+    def test_tk_scaling_stays_on_the_96dpi_grid(self) -> None:
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app.apply_tk_dpi_scaling(root)
+            app.apply_tk_dpi_scaling(root)
+            scaling = float(root.tk.call("tk", "scaling"))
+            self.assertAlmostEqual(scaling, 96.0 / 72.0, places=2)
+        finally:
+            root.destroy()
+
+    def test_failure_reason_scan_prompt_and_startup(self) -> None:
+        reason = app.short_failure_reason("链接 https://t.me/nope/1：找不到该用户名，请检查链接是否正确。")
+        self.assertNotIn("https://", reason)
+        self.assertIn("找不到该用户名", reason)
+        self.assertEqual(app.task_row_status_text("error", reason), reason)
+        self.assertEqual(app.scan_progress_text(3, True), "还有更多未扫描，点击继续加载")
+        self.assertIn("40%", app.scan_progress_text(3, True, scanning=True, seen=40, total=100))
+        self.assertEqual(app.scan_progress_text(3, False, scanning=False), "")
+        self.assertTrue(app.startup_shows_main_window(False))
+        self.assertFalse(app.startup_shows_main_window(True))
+        self.assertEqual(app.download_status_text(0), "就绪")
+        self.assertEqual(app.download_status_text(2), "下载中 2 项")
+
+    def test_middle_elide_keeps_both_ends(self) -> None:
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app.Fonts.init(root)
+            font = app.Fonts.help
+            full = r"C:\Users\Admin\AppData\Local\TGVideoDownloader\downloads\very-long"
+            shown = app.middle_elide(font, full, 80)
+            self.assertLess(font.measure(shown), font.measure(full))
+            self.assertTrue(shown.startswith("C:"))
+            self.assertTrue(shown.endswith("long") or shown.endswith("very-long") or "long" in shown)
+            self.assertIn("…", shown)
+            self.assertEqual(app.middle_elide(font, "短", 200), "短")
+        finally:
+            root.destroy()
+
+    def test_quality_row_does_not_show_two_highest_labels(self) -> None:
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app.Fonts.init(root)
+            var = tk.StringVar(value="最高")
+            picker = app.QualityPicker(root, var)
+            # Parent is withdrawn, so winfo_ismapped is false. Both widgets must not stay packed.
+            picker.configure_display("dropdown", "最高", ["最高", "720p", "480p"])
+            root.update_idletasks()
+            self.assertEqual(picker._lbl_title.cget("text"), "下载优先清晰度")
+            self.assertFalse(app.geometry_managed(picker._lbl_static))
+            self.assertTrue(app.geometry_managed(picker._box))
+            picker.configure_display("static", "最高", ["最高"])
+            self.assertTrue(app.geometry_managed(picker._lbl_static))
+            self.assertFalse(app.geometry_managed(picker._box))
+        finally:
+            root.destroy()
+
+    def test_refresh_button_matches_field_height(self) -> None:
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app.Fonts.init(root)
+            field = app.Field(root, height=32)
+            button = app.FlatButton(root, "刷新", height=32)
+            self.assertEqual(int(field.cget("height")), button._height)
+            self.assertEqual(button._height, app.ui_px(32))
+        finally:
+            root.destroy()
+
+    def test_link_box_keeps_placeholder_until_typing(self) -> None:
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app.Fonts.init(root)
+            box = app.PlaceholderText(root, placeholder="每行一条链接")
+            box.pack()
+            root.update_idletasks()
+            self.assertEqual(box.get("1.0", "end-1c"), "每行一条链接")
+            box.focus_set()
+            box.event_generate("<FocusIn>")
+            self.assertEqual(box.get_text(), "")
+            self.assertEqual(box.get("1.0", "end-1c"), "每行一条链接")
+        finally:
+            root.destroy()
+
+    def test_filter_counts_and_selected_chip(self) -> None:
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app.Fonts.init(root)
+            bar = app.FilterChipBar(root)
+            bar.pack(fill="x")
+            bar.set_counts({"全部": 4, "频道": 2, "群组": 1, "私聊": 1, "机器人": 0})
+            bar.set_value("频道")
+            root.update_idletasks()
+            bar.update()
+            labels = []
+            for item in bar.find_all():
+                if bar.type(item) == "text":
+                    labels.append(bar.itemcget(item, "text"))
+            self.assertTrue(any("频道" in label and "2" in label for label in labels), labels)
+            self.assertEqual(bar.value, "频道")
+        finally:
+            root.destroy()
 
 
 def _is_under(widget: tk.Misc, parent: tk.Misc) -> bool:
