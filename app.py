@@ -62,7 +62,6 @@ from tgcore import (
     load_cached_avatar,
     load_config,
     load_download_records,
-    login_dialog_after_session_loss,
     message_video_kind,
     original_media_name,
     primary_document_id,
@@ -670,6 +669,42 @@ def chrome_action(kind: str) -> str:
     if kind == "minimize":
         return "taskbar"
     raise ValueError(kind)
+
+
+def keep_window_after_unmap(*, dismissed: bool, minimized: bool) -> bool:
+    """A borderless dialog stays up when it only loses focus.
+
+    Explicit close and the minimize button are allowed to leave it hidden.
+    Clicking another window is not.
+    """
+    return not dismissed and not minimized
+
+
+def release_toolwindow_style(widget: tk.Misc) -> None:
+    """Borderless Tk windows are tool windows. Windows hides those on deactivate.
+
+    Clearing the tool-window bit lets the dialog remain after it loses focus.
+    Nothing happens on other platforms.
+    """
+    if sys.platform != "win32":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        user32 = ctypes.windll.user32
+        GA_ROOT = 2
+        GWL_EXSTYLE = -20
+        WS_EX_TOOLWINDOW = 0x00000080
+        user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.GetAncestor.restype = wintypes.HWND
+        child = int(widget.winfo_id())
+        hwnd = int(user32.GetAncestor(child, GA_ROOT) or child)
+        style = int(user32.GetWindowLongW(hwnd, GWL_EXSTYLE))
+        user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style & ~WS_EX_TOOLWINDOW)
+        user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
+    except Exception:
+        pass
 
 
 def chat_download_action(busy: bool) -> str:
@@ -3146,6 +3181,7 @@ class QualityPicker(tk.Frame):
 class ModalDialog(tk.Toplevel):
     def __init__(self, master: tk.Tk, title: str, width: int = 400) -> None:
         super().__init__(master)
+        self._dismissed = True
         self.withdraw()
         self._owner = master
         self._width = width
@@ -3173,12 +3209,19 @@ class ModalDialog(tk.Toplevel):
         self.body.pack(fill="both", expand=True, padx=16, pady=(16, 18))
         self.protocol("WM_DELETE_WINDOW", self.hide)
         self.bind("<Escape>", lambda _e: self.hide())
+        self.bind("<Unmap>", self._on_unmap, add="+")
+        self.bind("<Deactivate>", self._on_deactivate, add="+")
         self._on_hide: Optional[Callable[[], None]] = None
+        self._restoring = False
 
     def set_on_hide(self, fn: Optional[Callable[[], None]]) -> None:
         self._on_hide = fn
 
+    def wants_visible(self) -> bool:
+        return not self._dismissed
+
     def hide(self, notify: bool = True) -> None:
+        self._dismissed = True
         try:
             self.grab_release()
         except Exception:
@@ -3188,6 +3231,7 @@ class ModalDialog(tk.Toplevel):
             self._on_hide()
 
     def show(self) -> None:
+        self._dismissed = False
         owner = self._owner
         try:
             owner.update_idletasks()
@@ -3206,25 +3250,70 @@ class ModalDialog(tk.Toplevel):
         self.update_idletasks()
         self.geometry(geo)
         self.lift()
-        try:
-            self.grab_set()
-        except Exception:
-            pass
+        release_toolwindow_style(self)
+        # No grab. A grab turns "click another window" into a broken modal,
+        # and Windows then withdraws this borderless window until the tray
+        # icon restores its owner.
         self.focus_force()
         self.after_idle(self._raise_front)
 
     def _raise_front(self) -> None:
+        self._restore_if_open(refocus=False)
+
+    def _on_unmap(self, event: tk.Event) -> None:
+        if getattr(event, "widget", None) is not self or self._dismissed:
+            return
+        self.after_idle(self._restore_if_open)
+
+    def _on_deactivate(self, _event: tk.Event | None = None) -> None:
+        if self._dismissed:
+            return
+        self.after_idle(self._restore_if_open)
+
+    def _owner_hidden_on_purpose(self) -> bool:
+        owner = self._owner
+        if bool(getattr(owner, "_window_hidden", False) or getattr(owner, "_exiting", False)):
+            return True
+        return bool(getattr(owner, "_user_minimized", False))
+
+    def _restore_if_open(self, refocus: bool = False) -> None:
+        if self._restoring or self._dismissed or not self.winfo_exists():
+            return
+        if not keep_window_after_unmap(dismissed=False, minimized=self._owner_hidden_on_purpose()):
+            return
+        self._restoring = True
         try:
-            if not (self.winfo_exists() and self.winfo_ismapped()):
-                return
-            self.lift()
+            owner = self._owner
+            owner_hidden = False
             try:
-                self.grab_set()
-            except Exception:
-                pass
-            self.focus_force()
-        except Exception:
+                owner_hidden = owner is not None and not owner.winfo_viewable()
+            except tk.TclError:
+                owner_hidden = False
+            self_hidden = not self.winfo_viewable()
+            if not owner_hidden and not self_hidden:
+                if refocus:
+                    self.focus_force()
+                return
+            if owner_hidden and not self._owner_hidden_on_purpose():
+                try:
+                    owner.deiconify()
+                    try:
+                        owner.state("normal")
+                    except tk.TclError:
+                        pass
+                    owner.lift()
+                except tk.TclError:
+                    pass
+            if not self.winfo_viewable():
+                self.deiconify()
+                self.lift()
+            release_toolwindow_style(self)
+            if refocus:
+                self.focus_force()
+        except tk.TclError:
             pass
+        finally:
+            self._restoring = False
 
 
 class App(tk.Tk):
@@ -3242,6 +3331,8 @@ class App(tk.Tk):
         self._tray = None
         self._tray_hint_shown = False
         self._hiding_to_tray = False
+        self._window_hidden = False
+        self._user_minimized = False
         apply_window_icon(self, self._icon_photos)
         self.after_idle(lambda: apply_window_icon(self, self._icon_photos))
         self.bind("<Map>", self._on_window_map)
@@ -3447,6 +3538,7 @@ class App(tk.Tk):
         """Normal taskbar minimize. Close (X) is what hides to the tray."""
         if chrome_action("minimize") != "taskbar":
             return
+        self._user_minimized = True
         self._want_borderless_on_restore = bool(getattr(self, "_borderless", False))
         try:
             if self._borderless:
@@ -4279,13 +4371,8 @@ class App(tk.Tk):
             return
         for dialog in getattr(self, "_modals", []):
             try:
-                if dialog.winfo_exists() and dialog.winfo_ismapped() and dialog.state() != "withdrawn":
+                if dialog.wants_visible() and dialog.winfo_viewable():
                     dialog.lift()
-                    try:
-                        dialog.grab_set()
-                    except Exception:
-                        pass
-                    dialog.focus_force()
                     return
             except Exception:
                 continue
@@ -4344,11 +4431,13 @@ class App(tk.Tk):
     def _bootstrap(self) -> None:
         self._maybe_show_notice()
         self._maybe_autodetect_proxy()
-        if startup_login_target(has_credentials=has_api_credentials(self.cfg), authorized=False) == "api":
-            self._set_logged_in_state(False)
-            self._show_dialog(self.dlg_api)
+        # A saved session still connects and logs in on its own. Otherwise the
+        # main window stays usable and the login dialog waits for 「登录」.
+        if has_api_credentials(self.cfg):
+            self._start_loop_and_connect()
             return
-        self._start_loop_and_connect()
+        self._set_logged_in_state(False)
+        self._log("尚未登录。点右上角「登录」填写 API 后再连接。")
 
     def _maybe_show_notice(self) -> None:
         if self.cfg.get("noticed_personal_use"):
@@ -4480,8 +4569,7 @@ class App(tk.Tk):
             self._run_async(self._async_load_me_and_dialogs(), on_done=None, on_error=self._show_error)
             return
         self._set_logged_in_state(False)
-        self._log("需要登录账号。可点左侧边栏「登录」，或现在完成手机号验证。")
-        # 若用户已经在输入手机号/验证码，不要把窗口切回去
+        # 用户已经自己打开了登录窗时，不要把它关掉。否则只提示，不弹窗。
         target = startup_login_target(
             has_credentials=has_api_credentials(self.cfg),
             authorized=False,
@@ -4491,8 +4579,9 @@ class App(tk.Tk):
             api_dialog=self._login_dialog_open(self.dlg_api),
             phone_dialog=self._login_dialog_open(self.dlg_phone),
         )
-        if target == "phone":
-            self._show_dialog(self.dlg_phone)
+        if target == "stay":
+            return
+        self._log("尚未登录。点右上角「登录」后再下载。")
 
     def _login_dialog_open(self, *dialogs: ModalDialog) -> bool:
         for dialog in dialogs:
@@ -4507,11 +4596,13 @@ class App(tk.Tk):
         msg = explain_error(exc)
         self._log(msg, error=True)
         if "登录已失效" in msg:
-            messagebox.showwarning(APP_NAME, msg + "\n\n将清除本机会话，请重新登录。api_id 和代理设置会保留。")
+            messagebox.showwarning(
+                APP_NAME,
+                msg + "\n\n将清除本机会话。点右上角「登录」可重新登录。api_id 和代理设置会保留。",
+            )
             clear_session_only()
             self.cfg = load_config()
-            target = login_dialog_after_session_loss(has_api_credentials(self.cfg))
-            self._show_dialog(self.dlg_phone if target == "phone" else self.dlg_api)
+            self._set_logged_in_state(False)
         else:
             messagebox.showerror(APP_NAME, msg)
 
@@ -4821,15 +4912,8 @@ class App(tk.Tk):
             if done.get():
                 return
             result["ok"] = ok
-            try:
-                dlg.grab_release()
-            except Exception:
-                pass
-            try:
-                dlg.withdraw()
-            except Exception:
-                pass
             done.set(True)
+            dlg.hide(notify=False)
 
         dlg.set_on_hide(lambda: finish(False))
         tk.Label(
@@ -5798,15 +5882,64 @@ class App(tk.Tk):
 
     def _on_window_map(self, event: tk.Event) -> None:
         if event.widget is self:
+            self._user_minimized = False
             apply_window_icon(self, self._icon_photos)
             if getattr(self, "_want_borderless_on_restore", False):
                 self.after_idle(self._restore_borderless_chrome)
+            self.after_idle(self._relift_open_modal)
+
+    def _modal_wants_visible(self) -> bool:
+        for dialog in getattr(self, "_modals", []):
+            try:
+                if dialog.wants_visible():
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _on_window_unmap(self, event: tk.Event) -> None:
         # iconify unmaps the window. That is a taskbar minimize.
         # Withdrawing into the tray happens only from the close button.
-        if event.widget is not self:
+        # A login dialog losing focus must not take the main window with it.
+        if event.widget is not self or not self._modal_wants_visible():
             return
+        if not keep_window_after_unmap(
+            dismissed=bool(self._window_hidden or getattr(self, "_exiting", False)),
+            minimized=bool(self._user_minimized),
+        ):
+            return
+        self.after_idle(self._restore_main_if_dialog_open)
+
+    def _relift_open_modal(self) -> None:
+        if self._window_hidden or self._user_minimized or getattr(self, "_exiting", False):
+            return
+        for dialog in getattr(self, "_modals", []):
+            try:
+                if dialog.wants_visible():
+                    dialog._restore_if_open()
+                    return
+            except Exception:
+                continue
+
+    def _restore_main_if_dialog_open(self) -> None:
+        if not self._modal_wants_visible():
+            return
+        if not keep_window_after_unmap(
+            dismissed=bool(self._window_hidden or getattr(self, "_exiting", False)),
+            minimized=bool(self._user_minimized),
+        ):
+            return
+        try:
+            if self.winfo_viewable():
+                return
+            self.deiconify()
+            try:
+                self.state("normal")
+            except tk.TclError:
+                pass
+            self.lift()
+        except tk.TclError:
+            pass
 
     def _start_tray(self) -> None:
         if getattr(self, "_tray", None) is not None:
@@ -5845,6 +5978,7 @@ class App(tk.Tk):
     def _restore_from_tray(self) -> None:
         if getattr(self, "_exiting", False):
             return
+        self._window_hidden = False
         try:
             self.deiconify()
             try:
@@ -5871,6 +6005,7 @@ class App(tk.Tk):
         if getattr(self, "_tray", None) is None:
             self._quit_app()
             return
+        self._window_hidden = True
         self._hiding_to_tray = True
         try:
             try:
@@ -5919,6 +6054,7 @@ class App(tk.Tk):
             if not messagebox.askyesno(APP_NAME, "还有下载任务在进行。确定要退出吗？未下完的文件不会保留。"):
                 return
         self._exiting = True
+        self._window_hidden = True
         try:
             self.queue.prepare_for_exit()
         except Exception:

@@ -566,11 +566,12 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(dialog_title(user), "王 小明")
 
     def test_login_state_and_errors(self) -> None:
-        self.assertEqual(startup_login_target(has_credentials=False, authorized=True), "api")
+        self.assertEqual(startup_login_target(has_credentials=False, authorized=False), "defer")
+        self.assertEqual(startup_login_target(has_credentials=False, authorized=True), "defer")
         self.assertEqual(startup_login_target(has_credentials=True, authorized=True), "ready")
         self.assertEqual(startup_login_target(has_credentials=True, authorized=False, phone_pending=True), "stay")
         self.assertEqual(startup_login_target(has_credentials=True, authorized=False, code_dialog=True), "stay")
-        self.assertEqual(startup_login_target(has_credentials=True, authorized=False), "phone")
+        self.assertEqual(startup_login_target(has_credentials=True, authorized=False), "defer")
         self.assertEqual(login_dialog_after_session_loss(True), "phone")
         self.assertEqual(login_dialog_after_session_loss(False), "api")
         self.assertTrue(has_api_credentials({"api_id": "123", "api_hash": "abc"}))

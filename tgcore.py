@@ -1749,18 +1749,17 @@ def startup_login_target(
     api_dialog: bool = False,
     phone_dialog: bool = False,
 ) -> str:
-    """启动 / 连接完成后该打开哪个登录步骤。
+    """启动连上之后要不要弹出登录窗。
 
-    返回 ``api`` / ``phone`` / ``ready`` / ``stay``。
-    ``stay`` 表示用户已经在填写验证码或 API，不要把窗口拽回去。
+    ``ready``：已有会话，走自动登录，不要弹窗。
+    ``stay``：用户自己已经打开了登录步骤，不要关掉或换掉。
+    ``defer``：还没登录。主窗口保持可用，等用户点「登录」再打开对话框。
     """
-    if not has_credentials:
-        return "api"
-    if authorized:
+    if has_credentials and authorized:
         return "ready"
     if phone_pending or code_dialog or password_dialog or api_dialog or phone_dialog:
         return "stay"
-    return "phone"
+    return "defer"
 
 
 def login_dialog_after_session_loss(has_credentials: bool) -> str:

@@ -619,6 +619,148 @@ class CrossChatSelectionTests(unittest.TestCase):
         self.assertNotIn(8, host._picked.ids_for(album.id))
 
 
+class LoginFlowTests(unittest.TestCase):
+    def test_focus_loss_does_not_count_as_closing(self) -> None:
+        self.assertTrue(app.keep_window_after_unmap(dismissed=False, minimized=False))
+        self.assertFalse(app.keep_window_after_unmap(dismissed=True, minimized=False))
+        self.assertFalse(app.keep_window_after_unmap(dismissed=False, minimized=True))
+        source = (ROOT / "app.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        show = ""
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and node.name == "ModalDialog":
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef) and item.name == "show":
+                        show = ast.get_source_segment(source, item) or ""
+        self.assertNotIn("grab_set", show)
+        boot = ast.get_source_segment(source, _app_methods()["_bootstrap"]) or ""
+        after = ast.get_source_segment(source, _app_methods()["_after_startup"]) or ""
+        self.assertNotIn("_show_dialog", boot)
+        self.assertNotIn("_show_dialog", after)
+
+    def test_signed_out_startup_leaves_the_main_window_alone(self) -> None:
+        host = type("Host", (), {})()
+        host.events: list[str] = []
+        host.cfg = {}
+        host._maybe_show_notice = lambda: None
+        host._maybe_autodetect_proxy = lambda: None
+        host._set_logged_in_state = lambda *_a, **_k: host.events.append("logged-out")
+        host._log = lambda text, error=False: host.events.append(text)
+        host._start_loop_and_connect = lambda: host.events.append("connect")
+        host._show_dialog = lambda *_a, **_k: host.events.append("dialog")
+
+        app.App._bootstrap(host)
+        self.assertEqual(host.events[0], "logged-out")
+        self.assertTrue(any("登录" in item for item in host.events))
+        self.assertNotIn("dialog", host.events)
+        self.assertNotIn("connect", host.events)
+
+        host.events.clear()
+        host.cfg = {"api_id": "100000", "api_hash": "abcdef1234567890"}
+        app.App._bootstrap(host)
+        self.assertEqual(host.events, ["connect"])
+
+    def test_missing_session_does_not_pop_login_but_a_saved_one_still_loads(self) -> None:
+        host = type("Host", (), {})()
+        host.events: list[str] = []
+        host.cfg = {"api_id": "100000", "api_hash": "abcdef1234567890"}
+        host._phone_pending = None
+        host.dlg_code = host.dlg_2fa = host.dlg_api = host.dlg_phone = None
+        host._set_logged_in_state = lambda *_a, **_k: host.events.append("logged-out")
+        host._login_dialog_open = lambda *_a, **_k: False
+        host._log = lambda text, error=False: host.events.append(text)
+        host._show_dialog = lambda *_a, **_k: host.events.append("dialog")
+
+        async def _load() -> None:
+            return None
+
+        host._async_load_me_and_dialogs = _load
+        host._show_error = lambda _exc: None
+        host._run_async = lambda coro, on_done=None, on_error=None: host.events.append("autoload") or coro.close()
+
+        app.App._after_startup(host, False)
+        self.assertIn("logged-out", host.events)
+        self.assertTrue(any("登录" in item for item in host.events))
+        self.assertNotIn("dialog", host.events)
+        self.assertNotIn("autoload", host.events)
+
+        host.events.clear()
+        host._login_dialog_open = lambda *_a, **_k: True
+        app.App._after_startup(host, False)
+        self.assertEqual(host.events, ["logged-out"])
+
+        host.events.clear()
+        app.App._after_startup(host, True)
+        self.assertEqual(host.events, ["autoload"])
+
+    def test_main_window_stays_up_when_a_login_dialog_is_open(self) -> None:
+        host = type("Host", (), {})()
+        host._modals = [type("Dialog", (), {"wants_visible": lambda self: True})()]
+        host._window_hidden = False
+        host._exiting = False
+        host._user_minimized = False
+        host.calls: list[str] = []
+        host.winfo_viewable = lambda: False
+        host.deiconify = lambda: host.calls.append("deiconify")
+        host.state = lambda *_a, **_k: host.calls.append("normal")
+        host.lift = lambda: host.calls.append("lift")
+        host._modal_wants_visible = lambda: app.App._modal_wants_visible(host)
+
+        app.App._restore_main_if_dialog_open(host)
+        self.assertEqual(host.calls, ["deiconify", "normal", "lift"])
+
+        host._user_minimized = True
+        host.calls.clear()
+        app.App._restore_main_if_dialog_open(host)
+        self.assertEqual(host.calls, [])
+
+        host._user_minimized = False
+        host._window_hidden = True
+        app.App._restore_main_if_dialog_open(host)
+        self.assertEqual(host.calls, [])
+
+    def test_login_dialog_comes_back_if_focus_loss_hides_it(self) -> None:
+        root = tk.Tk()
+        root.geometry("480x320+40+40")
+        try:
+            app.Fonts.init(root)
+            dlg = app.ModalDialog(root, "登录", width=320)
+            tk.Label(dlg.body, text="手机号").pack()
+            root.update()
+            self.assertFalse(dlg.winfo_viewable())
+            dlg.show()
+            root.update()
+            self.assertTrue(dlg.winfo_viewable())
+            self.assertTrue(dlg.wants_visible())
+
+            # Windows withdraws a borderless grabbed dialog when it loses focus.
+            dlg.withdraw()
+            root.update()
+            self.assertTrue(dlg.winfo_viewable())
+            self.assertTrue(root.winfo_viewable())
+
+            root._user_minimized = True
+            dlg.withdraw()
+            root.update()
+            self.assertFalse(dlg.winfo_viewable())
+
+            root._user_minimized = False
+            dlg.event_generate("<Unmap>")
+            root.update()
+            self.assertTrue(dlg.winfo_viewable())
+
+            dlg.hide()
+            root.update()
+            self.assertFalse(dlg.winfo_viewable())
+            self.assertFalse(dlg.wants_visible())
+            dlg.withdraw()
+            dlg.event_generate("<Deactivate>")
+            root.update()
+            self.assertFalse(dlg.winfo_viewable())
+        finally:
+            root.destroy()
+
+
 class AppIconTests(unittest.TestCase):
     def test_packaged_icon_is_a_multisize_teal_folder(self) -> None:
         ico = ROOT / "app-icon.ico"
