@@ -355,6 +355,412 @@ class CaptionButtonTests(unittest.TestCase):
             root.destroy()
 
 
+def _chat(cid: int, title: str) -> app.DialogItem:
+    return app.DialogItem(entity=cid, title=title, kind="channel", id=cid)
+
+
+_AUTO_MESSAGE = object()
+
+
+def _video(mid: int, message: object = _AUTO_MESSAGE) -> app.VideoItem:
+    if message is _AUTO_MESSAGE:
+        message = type("Msg", (), {"id": mid})()
+    return app.VideoItem(
+        message_id=mid,
+        date=None,
+        duration=1,
+        size=10,
+        filename=f"{mid}.mp4",
+        caption="",
+        kind="video",
+        message=message,
+    )
+
+
+class CrossChatSelectionTests(unittest.TestCase):
+    def test_chat_switch_does_not_clear_the_remembered_set(self) -> None:
+        source = (ROOT / "app.py").read_text(encoding="utf-8")
+        methods = _app_methods()
+        sync = ast.get_source_segment(source, methods["_sync_chat_actions"]) or ""
+        download = ast.get_source_segment(source, methods["_on_download_selected"]) or ""
+        load = ast.get_source_segment(source, methods["_start_load_videos"]) or ""
+        self.assertIn("len(self._picked)", sync)
+        self.assertIn("picked_count_text", sync)
+        self.assertIn("select_all_mark", sync)
+        self.assertIn("_selected_download_batches", download)
+        self.assertNotIn("video_list.selected_ids", download)
+        self.assertNotIn("_picked.clear", load)
+
+    def test_checks_are_per_chat_and_message(self) -> None:
+        album = _chat(1, "相册")
+        channel = _chat(2, "频道")
+        picked = app.CrossChatSelection()
+        picked.set_checked(album, _video(5), True)
+        picked.set_checked(channel, _video(5), True)
+        picked.set_checked(channel, _video(8), True)
+        self.assertEqual(len(picked), 3)
+        self.assertEqual(picked.chat_count, 2)
+        self.assertEqual(picked.ids_for(album.id), {5})
+        self.assertEqual(picked.ids_for(channel.id), {5, 8})
+        self.assertEqual(app.picked_count_text(3, 2), "已选 3 · 2 个对话")
+        self.assertEqual(app.picked_count_text(1, 1), "已选 1")
+
+        picked.set_checked(album, _video(5), False)
+        self.assertEqual(len(picked), 2)
+        self.assertEqual(picked.ids_for(album.id), set())
+        self.assertEqual(picked.ids_for(channel.id), {5, 8})
+
+    def test_select_all_only_changes_the_open_chat(self) -> None:
+        album = _chat(1, "相册")
+        channel = _chat(2, "频道")
+        older = _video(4)
+        newer = _video(9)
+        picked = app.CrossChatSelection()
+        picked.set_checked(channel, _video(3), True)
+        picked.set_many(album, [older, newer], True)
+        self.assertEqual(picked.ids_for(album.id), {4, 9})
+        picked.set_many(album, [newer], False)
+        self.assertEqual(picked.ids_for(album.id), {4})
+        self.assertEqual(picked.ids_for(channel.id), {3})
+        self.assertEqual(app.select_all_mark(2, 2), "on")
+        self.assertEqual(app.select_all_mark(2, 1), "mid")
+        self.assertEqual(app.select_all_mark(2, 0), "off")
+        self.assertEqual(app.select_all_mark(0, 0), "off")
+
+    def test_reload_refreshes_the_message_without_adding_checks(self) -> None:
+        album = _chat(1, "相册")
+        fresh = type("Msg", (), {"id": 5, "fresh": True})()
+        picked = app.CrossChatSelection()
+        picked.set_checked(album, _video(5), True)
+        picked.refresh(album, [_video(5, fresh), _video(6)])
+        batches = picked.download_batches(album.id)
+        self.assertEqual(len(batches), 1)
+        self.assertIs(batches[0][1][0], fresh)
+        self.assertEqual(picked.ids_for(album.id), {5})
+
+    def test_download_covers_every_chat_newest_first(self) -> None:
+        album = _chat(1, "相册")
+        channel = _chat(2, "频道")
+        skipped = _video(10, message=None)
+        picked = app.CrossChatSelection()
+        picked.set_checked(channel, _video(1), True)
+        picked.set_checked(channel, _video(4), True)
+        picked.set_checked(album, _video(2), True)
+        picked.set_checked(album, _video(9), True)
+        picked.set_checked(album, skipped, True)
+        batches = picked.download_batches(album.id)
+        self.assertEqual([chat.id for chat, _messages in batches], [album.id, channel.id])
+        self.assertEqual([msg.id for msg in batches[0][1]], [9, 2])
+        self.assertEqual([msg.id for msg in batches[1][1]], [4, 1])
+        self.assertEqual(len(picked), 5)
+
+    def test_download_selected_queues_the_full_set(self) -> None:
+        album = _chat(1, "相册")
+        channel = _chat(2, "频道")
+        host = type("Host", (), {})()
+        host._picked = app.CrossChatSelection()
+        host._picked.set_checked(channel, _video(4), True)
+        host._picked.set_checked(channel, _video(1), True)
+        host._picked.set_checked(album, _video(9), True)
+        host._video_chat = album
+        host._selected_dialog = album
+        host._busy = False
+        host._stop_flag = type("Flag", (), {"is_set": lambda self: False})()
+        host.service = object()
+        host.started: list[tuple[int, list[int]]] = []
+        host.enqueued: list[tuple[int, list[int], bool]] = []
+        host.flown: list[int] = []
+        host._save_folder = lambda: Path(".")
+        host._begin_chat_download = lambda item, messages, folder: host.started.append(
+            (item.id, [msg.id for msg in messages])
+        )
+        host._enqueue_chat_download = lambda item, messages, folder, notify=True: host.enqueued.append(
+            (item.id, [msg.id for msg in messages], notify)
+        )
+        host._fly_task_to_links = host.flown.append
+        host._selected_download_batches = lambda: app.App._selected_download_batches(host)
+
+        app.App._on_download_selected(host)
+        self.assertEqual(host.started, [(album.id, [9])])
+        self.assertEqual(host.enqueued, [(channel.id, [4, 1], False)])
+        self.assertEqual(host.flown, [3])
+
+        host._busy = True
+        host.started.clear()
+        host.enqueued.clear()
+        host.flown.clear()
+        app.App._on_download_selected(host)
+        self.assertEqual(host.started, [])
+        self.assertEqual(host.enqueued, [(album.id, [9], False), (channel.id, [4, 1], False)])
+        self.assertEqual(host.flown, [3])
+
+    def test_switching_channels_keeps_the_store_and_restores_checks(self) -> None:
+        album = _chat(1, "相册")
+        channel = _chat(2, "频道")
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app.Fonts.init(root)
+            host = type("Host", (), {})()
+            host._picked = app.CrossChatSelection()
+            host._video_chat = album
+            host._video_items: list[app.VideoItem] = []
+            host._sync_chat_actions = lambda: None
+            host.video_list = app.VideoList(root, on_toggle=lambda item: app.App._on_video_toggle(host, item))
+
+            first = _video(11)
+            second = _video(12)
+            elsewhere = _video(21)
+            later = _video(4)
+            host._video_items = [first, second]
+            host.video_list.set_items(host._video_items)
+            host.video_list._toggle(first)
+            host.video_list._toggle(second)
+            self.assertEqual(host._picked.ids_for(album.id), {11, 12})
+
+            host._video_chat = channel
+            host._video_items = [elsewhere]
+            host.video_list.set_items(host._video_items, selected=host._picked.ids_for(channel.id))
+            host.video_list._toggle(elsewhere)
+            self.assertNotIn(11, host.video_list._rows)
+            self.assertEqual(host._picked.ids_for(album.id), {11, 12})
+            self.assertTrue(host.video_list._rows[21].selected)
+
+            host.video_list._toggle(elsewhere)
+            self.assertEqual(host._picked.ids_for(channel.id), set())
+            host.video_list._toggle(elsewhere)
+
+            host._picked.set_checked(album, later, True)
+            host._video_chat = album
+            host._video_items = [first]
+            host.video_list.set_items([first], selected=host._picked.ids_for(album.id))
+            self.assertTrue(host.video_list._rows[11].selected)
+            self.assertIn(4, host.video_list.selected_ids)
+            app.App._toggle_select_all(host)
+            self.assertEqual(host._picked.ids_for(album.id), {4, 12})
+            self.assertFalse(host.video_list._rows[11].selected)
+            self.assertEqual(host._picked.ids_for(channel.id), {21})
+
+            loaded = _video(4)
+            host._video_items = [first, loaded]
+            host.video_list.remember_selected(app.App._remember_loaded_checks(host, album))
+            host.video_list.append_items([loaded])
+            self.assertTrue(host.video_list._rows[4].selected)
+            self.assertFalse(host.video_list._rows[11].selected)
+            self.assertEqual(len(host._picked), 3)
+        finally:
+            root.destroy()
+
+    def test_loading_another_chat_does_not_drop_checks(self) -> None:
+        album = _chat(1, "相册")
+        channel = _chat(2, "频道")
+        fresh = type("Msg", (), {"id": 11, "fresh": True})()
+        host = type("Host", (), {})()
+        host.service = object()
+        host._picked = app.CrossChatSelection()
+        host._picked.set_checked(album, _video(11), True)
+        host._video_chat = album
+        host._video_items = [_video(11)]
+        host._video_gen = 3
+        host._video_scan = app.VideoScanState()
+        host._video_notices = []
+        host._video_has_more = False
+        host._video_loading = False
+        host.video_list = type("List", (), {"cleared": False, "clear": lambda self: setattr(self, "cleared", True)})()
+        host._reveal_video_chrome = lambda _title: None
+        host._show_video_empty = lambda _text: None
+        host._sync_chat_actions = lambda: None
+
+        async def _async_list_videos(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        host._async_list_videos = _async_list_videos
+        host._run_async = lambda coro, on_error=None: coro.close()
+
+        app.App._start_load_videos(host, channel, reset=True)
+        self.assertTrue(host.video_list.cleared)
+        self.assertEqual(host._video_chat.id, channel.id)
+        self.assertEqual(host._picked.ids_for(album.id), {11})
+
+        shown: list[set[int]] = []
+
+        class Listing:
+            def set_items(self, items: list[app.VideoItem], selected: set[int] | None = None, reset_scroll: bool = True) -> None:
+                shown.append(set(selected or []))
+
+            def remember_selected(self, message_ids: set[int]) -> None:
+                shown.append(set(message_ids))
+
+            def append_items(self, items: list[app.VideoItem]) -> None:
+                shown.append({item.message_id for item in items})
+
+            def refresh_quality(self, _pref: str) -> None:
+                return None
+
+        host._video_gen = 4
+        host._video_items = []
+        host.video_list = Listing()
+        host.var_quality = type("Var", (), {"get": lambda self: "最高"})()
+        host._download_records = lambda: []
+        host._remember_loaded_checks = lambda chat: app.App._remember_loaded_checks(host, chat)
+        host._log = lambda *_args, **_kwargs: None
+        host._show_video_list = lambda: None
+        host._sync_quality_options = lambda: None
+        page = type(
+            "Page",
+            (),
+            {"items": [_video(11, fresh), _video(8)], "notices": [], "state": app.VideoScanState(), "has_more": False},
+        )()
+        host._video_chat = album
+        app.App._apply_video_page(host, album, 4, page)
+        self.assertEqual(shown, [{11}])
+        self.assertTrue(host._picked.download_batches(album.id)[0][1][0].fresh)
+        self.assertEqual(host._picked.ids_for(album.id), {11})
+        self.assertNotIn(8, host._picked.ids_for(album.id))
+
+
+class LoginFlowTests(unittest.TestCase):
+    def test_focus_loss_does_not_count_as_closing(self) -> None:
+        self.assertTrue(app.keep_window_after_unmap(dismissed=False, minimized=False))
+        self.assertFalse(app.keep_window_after_unmap(dismissed=True, minimized=False))
+        self.assertFalse(app.keep_window_after_unmap(dismissed=False, minimized=True))
+        source = (ROOT / "app.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        show = ""
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and node.name == "ModalDialog":
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef) and item.name == "show":
+                        show = ast.get_source_segment(source, item) or ""
+        self.assertNotIn("grab_set", show)
+        boot = ast.get_source_segment(source, _app_methods()["_bootstrap"]) or ""
+        after = ast.get_source_segment(source, _app_methods()["_after_startup"]) or ""
+        self.assertNotIn("_show_dialog", boot)
+        self.assertNotIn("_show_dialog", after)
+
+    def test_signed_out_startup_leaves_the_main_window_alone(self) -> None:
+        host = type("Host", (), {})()
+        host.events: list[str] = []
+        host.cfg = {}
+        host._maybe_show_notice = lambda: None
+        host._maybe_autodetect_proxy = lambda: None
+        host._set_logged_in_state = lambda *_a, **_k: host.events.append("logged-out")
+        host._log = lambda text, error=False: host.events.append(text)
+        host._start_loop_and_connect = lambda: host.events.append("connect")
+        host._show_dialog = lambda *_a, **_k: host.events.append("dialog")
+
+        app.App._bootstrap(host)
+        self.assertEqual(host.events[0], "logged-out")
+        self.assertTrue(any("登录" in item for item in host.events))
+        self.assertNotIn("dialog", host.events)
+        self.assertNotIn("connect", host.events)
+
+        host.events.clear()
+        host.cfg = {"api_id": "100000", "api_hash": "abcdef1234567890"}
+        app.App._bootstrap(host)
+        self.assertEqual(host.events, ["connect"])
+
+    def test_missing_session_does_not_pop_login_but_a_saved_one_still_loads(self) -> None:
+        host = type("Host", (), {})()
+        host.events: list[str] = []
+        host.cfg = {"api_id": "100000", "api_hash": "abcdef1234567890"}
+        host._phone_pending = None
+        host.dlg_code = host.dlg_2fa = host.dlg_api = host.dlg_phone = None
+        host._set_logged_in_state = lambda *_a, **_k: host.events.append("logged-out")
+        host._login_dialog_open = lambda *_a, **_k: False
+        host._log = lambda text, error=False: host.events.append(text)
+        host._show_dialog = lambda *_a, **_k: host.events.append("dialog")
+
+        async def _load() -> None:
+            return None
+
+        host._async_load_me_and_dialogs = _load
+        host._show_error = lambda _exc: None
+        host._run_async = lambda coro, on_done=None, on_error=None: host.events.append("autoload") or coro.close()
+
+        app.App._after_startup(host, False)
+        self.assertIn("logged-out", host.events)
+        self.assertTrue(any("登录" in item for item in host.events))
+        self.assertNotIn("dialog", host.events)
+        self.assertNotIn("autoload", host.events)
+
+        host.events.clear()
+        host._login_dialog_open = lambda *_a, **_k: True
+        app.App._after_startup(host, False)
+        self.assertEqual(host.events, ["logged-out"])
+
+        host.events.clear()
+        app.App._after_startup(host, True)
+        self.assertEqual(host.events, ["autoload"])
+
+    def test_main_window_stays_up_when_a_login_dialog_is_open(self) -> None:
+        host = type("Host", (), {})()
+        host._modals = [type("Dialog", (), {"wants_visible": lambda self: True})()]
+        host._window_hidden = False
+        host._exiting = False
+        host._user_minimized = False
+        host.calls: list[str] = []
+        host.winfo_viewable = lambda: False
+        host.deiconify = lambda: host.calls.append("deiconify")
+        host.state = lambda *_a, **_k: host.calls.append("normal")
+        host.lift = lambda: host.calls.append("lift")
+        host._modal_wants_visible = lambda: app.App._modal_wants_visible(host)
+
+        app.App._restore_main_if_dialog_open(host)
+        self.assertEqual(host.calls, ["deiconify", "normal", "lift"])
+
+        host._user_minimized = True
+        host.calls.clear()
+        app.App._restore_main_if_dialog_open(host)
+        self.assertEqual(host.calls, [])
+
+        host._user_minimized = False
+        host._window_hidden = True
+        app.App._restore_main_if_dialog_open(host)
+        self.assertEqual(host.calls, [])
+
+    def test_login_dialog_comes_back_if_focus_loss_hides_it(self) -> None:
+        root = tk.Tk()
+        root.geometry("480x320+40+40")
+        try:
+            app.Fonts.init(root)
+            dlg = app.ModalDialog(root, "登录", width=320)
+            tk.Label(dlg.body, text="手机号").pack()
+            root.update()
+            self.assertFalse(dlg.winfo_viewable())
+            dlg.show()
+            root.update()
+            self.assertTrue(dlg.winfo_viewable())
+            self.assertTrue(dlg.wants_visible())
+
+            # Windows withdraws a borderless grabbed dialog when it loses focus.
+            dlg.withdraw()
+            root.update()
+            self.assertTrue(dlg.winfo_viewable())
+            self.assertTrue(root.winfo_viewable())
+
+            root._user_minimized = True
+            dlg.withdraw()
+            root.update()
+            self.assertFalse(dlg.winfo_viewable())
+
+            root._user_minimized = False
+            dlg.event_generate("<Unmap>")
+            root.update()
+            self.assertTrue(dlg.winfo_viewable())
+
+            dlg.hide()
+            root.update()
+            self.assertFalse(dlg.winfo_viewable())
+            self.assertFalse(dlg.wants_visible())
+            dlg.withdraw()
+            dlg.event_generate("<Deactivate>")
+            root.update()
+            self.assertFalse(dlg.winfo_viewable())
+        finally:
+            root.destroy()
+
+
 class AppIconTests(unittest.TestCase):
     def test_packaged_icon_is_a_multisize_teal_folder(self) -> None:
         ico = ROOT / "app-icon.ico"

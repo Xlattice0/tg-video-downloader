@@ -62,7 +62,6 @@ from tgcore import (
     load_cached_avatar,
     load_config,
     load_download_records,
-    login_dialog_after_session_loss,
     message_video_kind,
     original_media_name,
     primary_document_id,
@@ -672,9 +671,124 @@ def chrome_action(kind: str) -> str:
     raise ValueError(kind)
 
 
+def keep_window_after_unmap(*, dismissed: bool, minimized: bool) -> bool:
+    """A borderless dialog stays up when it only loses focus.
+
+    Explicit close and the minimize button are allowed to leave it hidden.
+    Clicking another window is not.
+    """
+    return not dismissed and not minimized
+
+
+def release_toolwindow_style(widget: tk.Misc) -> None:
+    """Borderless Tk windows are tool windows. Windows hides those on deactivate.
+
+    Clearing the tool-window bit lets the dialog remain after it loses focus.
+    Nothing happens on other platforms.
+    """
+    if sys.platform != "win32":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        user32 = ctypes.windll.user32
+        GA_ROOT = 2
+        GWL_EXSTYLE = -20
+        WS_EX_TOOLWINDOW = 0x00000080
+        user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.GetAncestor.restype = wintypes.HWND
+        child = int(widget.winfo_id())
+        hwnd = int(user32.GetAncestor(child, GA_ROOT) or child)
+        style = int(user32.GetWindowLongW(hwnd, GWL_EXSTYLE))
+        user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style & ~WS_EX_TOOLWINDOW)
+        user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
+    except Exception:
+        pass
+
+
 def chat_download_action(busy: bool) -> str:
     """A download already running must not block selecting and starting another."""
     return "enqueue" if busy else "start"
+
+
+def select_all_mark(visible_count: int, visible_selected: int) -> str:
+    """Header checkbox for the videos currently on screen."""
+    if visible_count > 0 and visible_selected >= visible_count:
+        return "on"
+    if visible_selected > 0:
+        return "mid"
+    return "off"
+
+
+def picked_count_text(count: int, chat_count: int) -> str:
+    """「已选」 covers every channel, and says so when more than one is involved."""
+    if chat_count > 1:
+        return f"已选 {count} · {chat_count} 个对话"
+    return f"已选 {count}"
+
+
+class CrossChatSelection:
+    """Checked videos remembered by (chat id, message id).
+
+    The on-screen list is rebuilt when the user opens another channel.
+    「已选」 and 「下载选中」 read this store, so those checks stay put.
+    """
+
+    def __init__(self) -> None:
+        self._items: dict[tuple[Any, int], tuple[DialogItem, VideoItem]] = {}
+        self._chat_order: list[Any] = []
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    @property
+    def chat_count(self) -> int:
+        return len({chat_id for chat_id, _message_id in self._items})
+
+    def clear(self) -> None:
+        self._items.clear()
+        self._chat_order.clear()
+
+    def ids_for(self, chat_id: Any) -> set[int]:
+        return {message_id for cid, message_id in self._items if cid == chat_id}
+
+    def set_checked(self, chat: DialogItem, item: VideoItem, checked: bool) -> None:
+        key = (chat.id, int(item.message_id))
+        if not checked:
+            self._items.pop(key, None)
+            if not self.ids_for(chat.id):
+                self._chat_order = [cid for cid in self._chat_order if cid != chat.id]
+            return
+        if chat.id not in self._chat_order:
+            self._chat_order.append(chat.id)
+        self._items[key] = (chat, item)
+
+    def set_many(self, chat: DialogItem, items: Iterable[VideoItem], checked: bool) -> None:
+        for item in items:
+            self.set_checked(chat, item, checked)
+
+    def refresh(self, chat: DialogItem, items: Iterable[VideoItem]) -> None:
+        """Keep the latest message object when this channel is loaded again."""
+        for item in items:
+            key = (chat.id, int(item.message_id))
+            if key in self._items:
+                self._items[key] = (chat, item)
+
+    def download_batches(self, current_chat_id: Any = None) -> list[tuple[DialogItem, list[Any]]]:
+        """One batch per chat. The open chat goes first; inside a chat, newer messages first."""
+        order = [cid for cid in self._chat_order if self.ids_for(cid)]
+        if current_chat_id in order:
+            order.remove(current_chat_id)
+            order.insert(0, current_chat_id)
+        batches: list[tuple[DialogItem, list[Any]]] = []
+        for cid in order:
+            rows = [self._items[key] for key in self._items if key[0] == cid]
+            rows.sort(key=lambda row: int(row[1].message_id), reverse=True)
+            messages = [item.message for _chat, item in rows if item.message is not None]
+            if messages:
+                batches.append((rows[0][0], messages))
+        return batches
 
 
 def merge_queue_keys(seed_keys: Iterable[str], preserved_keys: Iterable[str]) -> list[str]:
@@ -2384,13 +2498,21 @@ class VideoList(tk.Frame):
         self.scroll.reset_top()
 
     def set_items(self, items: list[VideoItem], selected: Optional[set[int]] = None, reset_scroll: bool = True) -> None:
+        kept = {int(mid) for mid in selected} if selected is not None else set()
         self.clear()
-        if selected:
-            self._selected = set(selected)
+        self._selected = kept
         for i, item in enumerate(items):
             self._append_row(item, divider=i > 0)
         if reset_scroll:
             self.scroll.reset_top()
+
+    def remember_selected(self, message_ids: Iterable[int]) -> None:
+        """Keep checks for messages that are not on screen yet, and paint the ones that are."""
+        self._selected.update(int(mid) for mid in message_ids)
+        for mid, row in self._rows.items():
+            want = mid in self._selected
+            if row.selected != want:
+                row.set_selected(want)
 
     def append_items(self, items: list[VideoItem]) -> None:
         start = len(self._order)
@@ -2422,9 +2544,19 @@ class VideoList(tk.Frame):
         self._on_toggle(item)
 
     def set_all_selected(self, selected: bool) -> None:
-        self._selected = set(self._order) if selected else set()
+        # Only the rows on screen. Checks for videos not loaded yet stay remembered.
+        if selected:
+            self._selected.update(self._order)
+        else:
+            self._selected.difference_update(self._order)
         for mid, row in self._rows.items():
             row.set_selected(mid in self._selected)
+
+    def clear_checks(self) -> None:
+        self._selected.clear()
+        for row in self._rows.values():
+            if row.selected:
+                row.set_selected(False)
 
     def update_thumb(self, message_id: int, data: bytes) -> None:
         row = self._rows.get(message_id)
@@ -2440,7 +2572,7 @@ class VideoList(tk.Frame):
         return set(self._selected)
 
     def all_selected(self) -> bool:
-        return bool(self._order) and len(self._selected) == len(self._order)
+        return bool(self._order) and set(self._order) <= self._selected
 
     def refresh_quality(self, pref: str) -> None:
         for row in self._rows.values():
@@ -3049,6 +3181,7 @@ class QualityPicker(tk.Frame):
 class ModalDialog(tk.Toplevel):
     def __init__(self, master: tk.Tk, title: str, width: int = 400) -> None:
         super().__init__(master)
+        self._dismissed = True
         self.withdraw()
         self._owner = master
         self._width = width
@@ -3076,12 +3209,19 @@ class ModalDialog(tk.Toplevel):
         self.body.pack(fill="both", expand=True, padx=16, pady=(16, 18))
         self.protocol("WM_DELETE_WINDOW", self.hide)
         self.bind("<Escape>", lambda _e: self.hide())
+        self.bind("<Unmap>", self._on_unmap, add="+")
+        self.bind("<Deactivate>", self._on_deactivate, add="+")
         self._on_hide: Optional[Callable[[], None]] = None
+        self._restoring = False
 
     def set_on_hide(self, fn: Optional[Callable[[], None]]) -> None:
         self._on_hide = fn
 
+    def wants_visible(self) -> bool:
+        return not self._dismissed
+
     def hide(self, notify: bool = True) -> None:
+        self._dismissed = True
         try:
             self.grab_release()
         except Exception:
@@ -3091,6 +3231,7 @@ class ModalDialog(tk.Toplevel):
             self._on_hide()
 
     def show(self) -> None:
+        self._dismissed = False
         owner = self._owner
         try:
             owner.update_idletasks()
@@ -3109,25 +3250,70 @@ class ModalDialog(tk.Toplevel):
         self.update_idletasks()
         self.geometry(geo)
         self.lift()
-        try:
-            self.grab_set()
-        except Exception:
-            pass
+        release_toolwindow_style(self)
+        # No grab. A grab turns "click another window" into a broken modal,
+        # and Windows then withdraws this borderless window until the tray
+        # icon restores its owner.
         self.focus_force()
         self.after_idle(self._raise_front)
 
     def _raise_front(self) -> None:
+        self._restore_if_open(refocus=False)
+
+    def _on_unmap(self, event: tk.Event) -> None:
+        if getattr(event, "widget", None) is not self or self._dismissed:
+            return
+        self.after_idle(self._restore_if_open)
+
+    def _on_deactivate(self, _event: tk.Event | None = None) -> None:
+        if self._dismissed:
+            return
+        self.after_idle(self._restore_if_open)
+
+    def _owner_hidden_on_purpose(self) -> bool:
+        owner = self._owner
+        if bool(getattr(owner, "_window_hidden", False) or getattr(owner, "_exiting", False)):
+            return True
+        return bool(getattr(owner, "_user_minimized", False))
+
+    def _restore_if_open(self, refocus: bool = False) -> None:
+        if self._restoring or self._dismissed or not self.winfo_exists():
+            return
+        if not keep_window_after_unmap(dismissed=False, minimized=self._owner_hidden_on_purpose()):
+            return
+        self._restoring = True
         try:
-            if not (self.winfo_exists() and self.winfo_ismapped()):
-                return
-            self.lift()
+            owner = self._owner
+            owner_hidden = False
             try:
-                self.grab_set()
-            except Exception:
-                pass
-            self.focus_force()
-        except Exception:
+                owner_hidden = owner is not None and not owner.winfo_viewable()
+            except tk.TclError:
+                owner_hidden = False
+            self_hidden = not self.winfo_viewable()
+            if not owner_hidden and not self_hidden:
+                if refocus:
+                    self.focus_force()
+                return
+            if owner_hidden and not self._owner_hidden_on_purpose():
+                try:
+                    owner.deiconify()
+                    try:
+                        owner.state("normal")
+                    except tk.TclError:
+                        pass
+                    owner.lift()
+                except tk.TclError:
+                    pass
+            if not self.winfo_viewable():
+                self.deiconify()
+                self.lift()
+            release_toolwindow_style(self)
+            if refocus:
+                self.focus_force()
+        except tk.TclError:
             pass
+        finally:
+            self._restoring = False
 
 
 class App(tk.Tk):
@@ -3145,6 +3331,8 @@ class App(tk.Tk):
         self._tray = None
         self._tray_hint_shown = False
         self._hiding_to_tray = False
+        self._window_hidden = False
+        self._user_minimized = False
         apply_window_icon(self, self._icon_photos)
         self.after_idle(lambda: apply_window_icon(self, self._icon_photos))
         self.bind("<Map>", self._on_window_map)
@@ -3167,6 +3355,7 @@ class App(tk.Tk):
         self._selected_dialog: Optional[DialogItem] = None
         self._video_chat: Optional[DialogItem] = None
         self._video_items: list[VideoItem] = []
+        self._picked = CrossChatSelection()
         self._video_gen = 0
         self._video_loading = False
         self._video_has_more = False
@@ -3349,6 +3538,7 @@ class App(tk.Tk):
         """Normal taskbar minimize. Close (X) is what hides to the tray."""
         if chrome_action("minimize") != "taskbar":
             return
+        self._user_minimized = True
         self._want_borderless_on_restore = bool(getattr(self, "_borderless", False))
         try:
             if self._borderless:
@@ -3706,7 +3896,7 @@ class App(tk.Tk):
         self.lbl_video_empty.pack(pady=(10, 0))
         self.video_empty.place(relx=0.5, rely=0.5, anchor="center")
 
-        self.video_list = VideoList(self.video_body, on_toggle=lambda _item: self._sync_chat_actions())
+        self.video_list = VideoList(self.video_body, on_toggle=self._on_video_toggle)
 
         foot = tk.Frame(right, bg=C_FOOT, height=44)
         self.video_footer = foot
@@ -3761,15 +3951,12 @@ class App(tk.Tk):
         if not hasattr(self, "btn_dl_selected"):
             return
         has_items = bool(self._video_items)
-        selected_n = len(self.video_list.selected_ids) if has_items else 0
+        visible_ids = {v.message_id for v in self._video_items}
+        visible_selected = len(visible_ids & self.video_list.selected_ids) if has_items else 0
+        selected_n = len(self._picked)
         can_fetch = bool(self._logged_in and not self._busy)
         can_download = bool(self._logged_in and selected_n)
-        if has_items and selected_n == len(self._video_items):
-            self.chk_select_all.set_state("on")
-        elif selected_n:
-            self.chk_select_all.set_state("mid")
-        else:
-            self.chk_select_all.set_state("off")
+        self.chk_select_all.set_state(select_all_mark(len(self._video_items), visible_selected))
         self.chk_select_all.set_enabled(has_items)
         if self._video_chat is not None and not (self._video_loading and not has_items):
             note_n = len(getattr(self, "_video_notices", []) or [])
@@ -3781,14 +3968,31 @@ class App(tk.Tk):
             self.lbl_video_count.configure(text="")
         more_ok = can_fetch and self._video_chat is not None and self._video_has_more and not self._video_loading
         self.btn_load_more.set_state("normal" if more_ok else "disabled")
-        self.lbl_picked.configure(text=f"已选 {selected_n}")
+        self.lbl_picked.configure(text=picked_count_text(selected_n, self._picked.chat_count))
         self.btn_dl_selected.set_state("normal" if can_download else "disabled")
 
-    def _toggle_select_all(self) -> None:
-        if not self._video_items:
-            return
-        self.video_list.set_all_selected(not self.video_list.all_selected())
+    def _on_video_toggle(self, item: VideoItem) -> None:
+        chat = self._video_chat
+        if chat is not None:
+            self._picked.set_checked(chat, item, item.message_id in self.video_list.selected_ids)
         self._sync_chat_actions()
+
+    def _toggle_select_all(self) -> None:
+        if not self._video_items or self._video_chat is None:
+            return
+        select = not self.video_list.all_selected()
+        self.video_list.set_all_selected(select)
+        self._picked.set_many(self._video_chat, self._video_items, select)
+        self._sync_chat_actions()
+
+    def _remember_loaded_checks(self, chat: DialogItem) -> set[int]:
+        self._picked.refresh(chat, self._video_items)
+        return self._picked.ids_for(chat.id)
+
+    def _selected_download_batches(self) -> list[tuple[DialogItem, list[Any]]]:
+        current = self._video_chat or self._selected_dialog
+        chat_id = current.id if current is not None else None
+        return self._picked.download_batches(chat_id)
 
     def _quality_pref(self) -> str:
         return quality_pref_value(self.var_quality.get())
@@ -3926,6 +4130,12 @@ class App(tk.Tk):
         self._account_name = name or self._account_name
         self._refresh_account_bar()
         if not logged_in:
+            picked = getattr(self, "_picked", None)
+            if picked is not None:
+                picked.clear()
+            listing = getattr(self, "video_list", None)
+            if listing is not None:
+                listing.clear_checks()
             self.btn_dl_link.set_state("disabled")
         elif not self._busy:
             self.btn_dl_link.set_state("normal")
@@ -4161,13 +4371,8 @@ class App(tk.Tk):
             return
         for dialog in getattr(self, "_modals", []):
             try:
-                if dialog.winfo_exists() and dialog.winfo_ismapped() and dialog.state() != "withdrawn":
+                if dialog.wants_visible() and dialog.winfo_viewable():
                     dialog.lift()
-                    try:
-                        dialog.grab_set()
-                    except Exception:
-                        pass
-                    dialog.focus_force()
                     return
             except Exception:
                 continue
@@ -4226,11 +4431,13 @@ class App(tk.Tk):
     def _bootstrap(self) -> None:
         self._maybe_show_notice()
         self._maybe_autodetect_proxy()
-        if startup_login_target(has_credentials=has_api_credentials(self.cfg), authorized=False) == "api":
-            self._set_logged_in_state(False)
-            self._show_dialog(self.dlg_api)
+        # A saved session still connects and logs in on its own. Otherwise the
+        # main window stays usable and the login dialog waits for 「登录」.
+        if has_api_credentials(self.cfg):
+            self._start_loop_and_connect()
             return
-        self._start_loop_and_connect()
+        self._set_logged_in_state(False)
+        self._log("尚未登录。点右上角「登录」填写 API 后再连接。")
 
     def _maybe_show_notice(self) -> None:
         if self.cfg.get("noticed_personal_use"):
@@ -4362,8 +4569,7 @@ class App(tk.Tk):
             self._run_async(self._async_load_me_and_dialogs(), on_done=None, on_error=self._show_error)
             return
         self._set_logged_in_state(False)
-        self._log("需要登录账号。可点左侧边栏「登录」，或现在完成手机号验证。")
-        # 若用户已经在输入手机号/验证码，不要把窗口切回去
+        # 用户已经自己打开了登录窗时，不要把它关掉。否则只提示，不弹窗。
         target = startup_login_target(
             has_credentials=has_api_credentials(self.cfg),
             authorized=False,
@@ -4373,8 +4579,9 @@ class App(tk.Tk):
             api_dialog=self._login_dialog_open(self.dlg_api),
             phone_dialog=self._login_dialog_open(self.dlg_phone),
         )
-        if target == "phone":
-            self._show_dialog(self.dlg_phone)
+        if target == "stay":
+            return
+        self._log("尚未登录。点右上角「登录」后再下载。")
 
     def _login_dialog_open(self, *dialogs: ModalDialog) -> bool:
         for dialog in dialogs:
@@ -4389,11 +4596,13 @@ class App(tk.Tk):
         msg = explain_error(exc)
         self._log(msg, error=True)
         if "登录已失效" in msg:
-            messagebox.showwarning(APP_NAME, msg + "\n\n将清除本机会话，请重新登录。api_id 和代理设置会保留。")
+            messagebox.showwarning(
+                APP_NAME,
+                msg + "\n\n将清除本机会话。点右上角「登录」可重新登录。api_id 和代理设置会保留。",
+            )
             clear_session_only()
             self.cfg = load_config()
-            target = login_dialog_after_session_loss(has_api_credentials(self.cfg))
-            self._show_dialog(self.dlg_phone if target == "phone" else self.dlg_api)
+            self._set_logged_in_state(False)
         else:
             messagebox.showerror(APP_NAME, msg)
 
@@ -4703,15 +4912,8 @@ class App(tk.Tk):
             if done.get():
                 return
             result["ok"] = ok
-            try:
-                dlg.grab_release()
-            except Exception:
-                pass
-            try:
-                dlg.withdraw()
-            except Exception:
-                pass
             done.set(True)
+            dlg.hide(notify=False)
 
         dlg.set_on_hide(lambda: finish(False))
         tk.Label(
@@ -5125,12 +5327,13 @@ class App(tk.Tk):
             self._log(note)
         if not self._video_items:
             self._video_items = list(videos)
+            checks = self._remember_loaded_checks(item)
             if not videos:
                 self._show_video_empty(
                     "\n".join(page.notices[:4]) if page.notices else "这个对话里没有可下载的视频"
                 )
             else:
-                self.video_list.set_items(self._video_items)
+                self.video_list.set_items(self._video_items, selected=checks)
                 self._show_video_list()
         else:
             existing = {v.message_id for v in self._video_items}
@@ -5140,11 +5343,12 @@ class App(tk.Tk):
                 self._video_items.sort(key=lambda v: v.message_id, reverse=True)
                 self.video_list.set_items(
                     self._video_items,
-                    selected=self.video_list.selected_ids,
+                    selected=self._remember_loaded_checks(item),
                     reset_scroll=False,
                 )
             else:
                 self._video_items.extend(added)
+                self.video_list.remember_selected(self._remember_loaded_checks(item))
                 if added:
                     self.video_list.append_items(added)
             if self._video_items:
@@ -5204,7 +5408,9 @@ class App(tk.Tk):
                 document_id=primary_document_id(msg),
             )
 
-    def _enqueue_chat_download(self, item: DialogItem, messages: list[Any], folder: Path) -> None:
+    def _enqueue_chat_download(
+        self, item: DialogItem, messages: list[Any], folder: Path, *, notify: bool = True
+    ) -> None:
         """Queue more chat videos without clearing the download that is running."""
         self._task_gen += 1
         gen = self._task_gen
@@ -5220,33 +5426,10 @@ class App(tk.Tk):
             self.tasks.upsert(key, name, status, total=total)
         self._refresh_task_header()
         self._log(f"已加入 {len(messages)} 个视频，会在当前任务后继续下载。")
-        self._fly_task_to_links(len(messages))
+        if notify:
+            self._fly_task_to_links(len(messages))
 
-    def _on_download_selected(self) -> None:
-        if self._busy and self._stop_flag.is_set():
-            messagebox.showinfo(APP_NAME, "正在暂停，请稍候再开始新的下载。")
-            return
-        item = self._video_chat or self._selected_dialog
-        if not item:
-            messagebox.showwarning(APP_NAME, "请先选择一个对话。")
-            return
-        chosen_ids = self.video_list.selected_ids
-        messages = [v.message for v in self._video_items if v.message_id in chosen_ids and v.message is not None]
-        # 保持当前列表顺序（新到旧）
-        if not messages:
-            messagebox.showwarning(APP_NAME, "请先勾选要下载的视频。")
-            return
-        try:
-            folder = self._save_folder()
-        except Exception as exc:
-            messagebox.showerror(APP_NAME, explain_error(exc))
-            return
-        if not self.service:
-            messagebox.showwarning(APP_NAME, "尚未连接，请先完成登录。")
-            return
-        if chat_download_action(self._busy) == "enqueue":
-            self._enqueue_chat_download(item, messages, folder)
-            return
+    def _begin_chat_download(self, item: DialogItem, messages: list[Any], folder: Path) -> None:
         self._task_gen += 1
         gen = self._task_gen
         title = item.title or ""
@@ -5258,7 +5441,34 @@ class App(tk.Tk):
             label="对话下载",
             keep_tasks=True,
         )
-        self._fly_task_to_links(len(messages))
+
+    def _on_download_selected(self) -> None:
+        if self._busy and self._stop_flag.is_set():
+            messagebox.showinfo(APP_NAME, "正在暂停，请稍候再开始新的下载。")
+            return
+        batches = self._selected_download_batches()
+        if not batches:
+            messagebox.showwarning(APP_NAME, "请先勾选要下载的视频。")
+            return
+        try:
+            folder = self._save_folder()
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, explain_error(exc))
+            return
+        if not self.service:
+            messagebox.showwarning(APP_NAME, "尚未连接，请先完成登录。")
+            return
+        total = sum(len(messages) for _item, messages in batches)
+        if chat_download_action(self._busy) == "enqueue":
+            for item, messages in batches:
+                self._enqueue_chat_download(item, messages, folder, notify=False)
+            self._fly_task_to_links(total)
+            return
+        item, messages = batches[0]
+        self._begin_chat_download(item, messages, folder)
+        for item, messages in batches[1:]:
+            self._enqueue_chat_download(item, messages, folder, notify=False)
+        self._fly_task_to_links(total)
 
     async def _async_download_selected(
         self,
@@ -5672,15 +5882,64 @@ class App(tk.Tk):
 
     def _on_window_map(self, event: tk.Event) -> None:
         if event.widget is self:
+            self._user_minimized = False
             apply_window_icon(self, self._icon_photos)
             if getattr(self, "_want_borderless_on_restore", False):
                 self.after_idle(self._restore_borderless_chrome)
+            self.after_idle(self._relift_open_modal)
+
+    def _modal_wants_visible(self) -> bool:
+        for dialog in getattr(self, "_modals", []):
+            try:
+                if dialog.wants_visible():
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _on_window_unmap(self, event: tk.Event) -> None:
         # iconify unmaps the window. That is a taskbar minimize.
         # Withdrawing into the tray happens only from the close button.
-        if event.widget is not self:
+        # A login dialog losing focus must not take the main window with it.
+        if event.widget is not self or not self._modal_wants_visible():
             return
+        if not keep_window_after_unmap(
+            dismissed=bool(self._window_hidden or getattr(self, "_exiting", False)),
+            minimized=bool(self._user_minimized),
+        ):
+            return
+        self.after_idle(self._restore_main_if_dialog_open)
+
+    def _relift_open_modal(self) -> None:
+        if self._window_hidden or self._user_minimized or getattr(self, "_exiting", False):
+            return
+        for dialog in getattr(self, "_modals", []):
+            try:
+                if dialog.wants_visible():
+                    dialog._restore_if_open()
+                    return
+            except Exception:
+                continue
+
+    def _restore_main_if_dialog_open(self) -> None:
+        if not self._modal_wants_visible():
+            return
+        if not keep_window_after_unmap(
+            dismissed=bool(self._window_hidden or getattr(self, "_exiting", False)),
+            minimized=bool(self._user_minimized),
+        ):
+            return
+        try:
+            if self.winfo_viewable():
+                return
+            self.deiconify()
+            try:
+                self.state("normal")
+            except tk.TclError:
+                pass
+            self.lift()
+        except tk.TclError:
+            pass
 
     def _start_tray(self) -> None:
         if getattr(self, "_tray", None) is not None:
@@ -5719,6 +5978,7 @@ class App(tk.Tk):
     def _restore_from_tray(self) -> None:
         if getattr(self, "_exiting", False):
             return
+        self._window_hidden = False
         try:
             self.deiconify()
             try:
@@ -5745,6 +6005,7 @@ class App(tk.Tk):
         if getattr(self, "_tray", None) is None:
             self._quit_app()
             return
+        self._window_hidden = True
         self._hiding_to_tray = True
         try:
             try:
@@ -5793,6 +6054,7 @@ class App(tk.Tk):
             if not messagebox.askyesno(APP_NAME, "还有下载任务在进行。确定要退出吗？未下完的文件不会保留。"):
                 return
         self._exiting = True
+        self._window_hidden = True
         try:
             self.queue.prepare_for_exit()
         except Exception:
